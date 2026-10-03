@@ -2,7 +2,8 @@
 
 Agents never get a shell. Read tools are always available; write tools only
 for the implementer. Every path goes through `Workspace.resolve`, so nothing
-outside the working copy can be read or written.
+outside the working copy can be read or written, and edits that would break
+Python syntax are rejected before they touch the file.
 """
 
 from __future__ import annotations
@@ -59,6 +60,8 @@ def make_tools(ws: Workspace, *, writable: bool) -> list[BaseTool]:
             target = ws.resolve(path)
         except WorkspaceError as exc:
             return f"ERROR: {exc}"
+        if problem := _syntax_problem(path, content):
+            return problem
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
         return f"wrote {path} ({len(content)} chars)"
@@ -77,10 +80,27 @@ def make_tools(ws: Workspace, *, writable: bool) -> list[BaseTool]:
         count = text.count(old)
         if count != 1:
             return f"ERROR: `old` found {count} times in {path}; it must match exactly once"
-        target.write_text(text.replace(old, new, 1))
+        updated = text.replace(old, new, 1)
+        if problem := _syntax_problem(path, updated):
+            return problem
+        target.write_text(updated)
         return f"edited {path}"
 
     funcs: list[Callable[..., str]] = [list_files, read_file, search]
     if writable:
         funcs += [write_file, replace_in_file]
     return [StructuredTool.from_function(f) for f in funcs]
+
+
+def _syntax_problem(path: str, content: str) -> str | None:
+    """Reject edits that would leave a Python file unparseable."""
+    if not path.endswith(".py"):
+        return None
+    try:
+        compile(content, path, "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        return (
+            f"ERROR: edit rejected — {path} would not parse: {exc.msg} at line {exc.lineno}. "
+            "The file is unchanged; check indentation and brackets."
+        )
+    return None

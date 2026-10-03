@@ -113,11 +113,11 @@ def run(
         console.print(f"  [red]✗[/] {exc}")
         raise typer.Exit(1) from exc
     status = state.get("status")
-    color = "green" if status == "validated" else "red"
+    color = "green" if status == "approved" else "red"
     if error := state.get("error"):
         console.print(f"  [red]{error}[/]")
     console.print(f"[{color}]{status}[/] · report: {run_dir / 'report.json'}")
-    raise typer.Exit(0 if status == "validated" else 1)
+    raise typer.Exit(0 if status == "approved" else 1)
 
 
 def _describe(node: str, state: dict[str, Any]) -> str:
@@ -133,6 +133,16 @@ def _describe(node: str, state: dict[str, Any]) -> str:
         return f": {state['implement_steps']} steps, changed {state['changed_files']}{done}"
     if node == "validate":
         return ": " + ", ".join(f"{'✓' if r.ok else '✗'} {r.command}" for r in state["validation"])
+    if node == "review":
+        if "review" not in state:
+            return f" [red]{state.get('error', 'failed')}[/]"
+        review = state["review"]
+        verdict = "[green]approved[/]" if review.approved else "[yellow]changes requested[/]"
+        lines = "".join(f"\n      [{f.severity}] {f.file}: {f.issue}" for f in review.findings)
+        return f": {verdict} — {review.summary}{lines}"
+    if node == "repair":
+        last = state["repairs"][-1]
+        return f" #{state['repair_attempts']} ({last['reason']}): {last['steps']} steps"
     return ""
 
 

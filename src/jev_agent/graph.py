@@ -1,9 +1,13 @@
-"""Ticket-to-diff workflow as a LangGraph state machine (M2: linear happy path).
+"""Ticket-to-diff workflow as a LangGraph state machine.
 
-    load → prepare_workspace → plan → implement → validate → report
+    prepare_workspace → plan → implement → validate ─┬→ review ─┬→ report
+                                   ↑                 │          │
+                                   └──── repair ←────┴──────────┘
+                                   (bounded: max_repair_attempts)
 
-Policy checks, repair loops, review and Jev decision edges plug into this graph
-in later milestones.
+`validate` runs the project's autofix commands, then its checks. Failed checks
+or blocking review findings send the change to `repair` while attempts remain.
+Policy checks and Jev decision edges plug into this graph in later milestones.
 """
 
 from __future__ import annotations
@@ -18,7 +22,15 @@ from typing import Any, Literal, TypedDict
 from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
-from jev_agent.agents import Plan, StructuredOutputError, implement_plan, plan_ticket
+from jev_agent.agents import (
+    Plan,
+    Review,
+    StructuredOutputError,
+    implement_plan,
+    plan_ticket,
+    repair_change,
+    review_change,
+)
 from jev_agent.config import ModelTier
 from jev_agent.llm import CallLog, LLMError
 from jev_agent.project import ProjectInstructions, load_instructions
@@ -26,7 +38,7 @@ from jev_agent.tickets import Ticket
 from jev_agent.tools import make_tools
 from jev_agent.workspace import CommandResult, Workspace
 
-Status = Literal["validated", "validation_failed", "incomplete", "no_changes", "error"]
+Status = Literal["approved", "changes_requested", "validation_failed", "no_changes", "error"]
 ModelFactory = Callable[[ModelTier, CallLog], BaseChatModel]
 
 
@@ -38,6 +50,8 @@ class RunConfig:
     call_log: CallLog = field(default_factory=CallLog)
     plan_max_steps: int = 12
     implement_max_steps: int = 30
+    repair_max_steps: int = 15
+    max_repair_attempts: int = 3
     setup_command: str | None = "uv sync --quiet"
 
 
@@ -45,13 +59,18 @@ class RunState(TypedDict, total=False):
     ticket: Ticket
     workspace: Workspace
     instructions: ProjectInstructions
+    setup: CommandResult
     plan: Plan
     implement_finished: bool
     implement_steps: int
     tool_calls: list[str]
-    setup: CommandResult
-    validation: list[CommandResult]
     changed_files: list[str]
+    autofix: list[CommandResult]
+    validation: list[CommandResult]
+    checks_passed: bool
+    review: Review
+    repair_attempts: int
+    repairs: list[dict[str, Any]]
     status: Status
     error: str
     started_at: float
@@ -63,7 +82,12 @@ def build_graph(cfg: RunConfig) -> Any:
 
     def prepare_workspace(state: RunState) -> RunState:
         ws = Workspace.create(cfg.repo, cfg.run_dir)
-        update: RunState = {"workspace": ws, "instructions": load_instructions(ws.root)}
+        update: RunState = {
+            "workspace": ws,
+            "instructions": load_instructions(ws.root),
+            "repair_attempts": 0,
+            "repairs": [],
+        }
         if cfg.setup_command:
             update["setup"] = ws.run(cfg.setup_command)
         return update
@@ -81,9 +105,6 @@ def build_graph(cfg: RunConfig) -> Any:
         except (LLMError, StructuredOutputError) as exc:
             return {"status": "error", "error": f"planning failed: {exc}"}
         return {"plan": result}
-
-    def after_plan(state: RunState) -> str:
-        return "report" if state.get("status") == "error" else "implement"
 
     def implement(state: RunState) -> RunState:
         tools = make_tools(state["workspace"], writable=True)
@@ -107,34 +128,126 @@ def build_graph(cfg: RunConfig) -> Any:
 
     def validate(state: RunState) -> RunState:
         ws = state["workspace"]
+        fixes = [ws.run(cmd) for cmd in state["instructions"].autofix.values()]
         results = [ws.run(cmd) for cmd in state["instructions"].commands.values()]
-        if not state.get("changed_files"):
-            status: Status = "no_changes"
-        elif not state.get("implement_finished"):
-            status = "incomplete"
-        elif all(r.ok for r in results):
-            status = "validated"
+        return {
+            "autofix": fixes,
+            "validation": results,
+            "checks_passed": all(r.ok for r in results),
+            "changed_files": ws.changed_files(),
+        }
+
+    def review(state: RunState) -> RunState:
+        try:
+            result = review_change(
+                model(ModelTier.STRONG),
+                state["ticket"],
+                state["instructions"],
+                state["workspace"].diff(),
+            )
+        except (LLMError, StructuredOutputError) as exc:
+            return {"error": f"review failed: {exc}"}
+        return {"review": result}
+
+    def repair(state: RunState) -> RunState:
+        if not state.get("checks_passed"):
+            reason = "checks"
+            problems = _failed_checks(state.get("validation", []))
         else:
-            status = "validation_failed"
-        return {"validation": results, "status": status}
+            reason = "review"
+            problems = _blocking_findings(state["review"])
+        loop = repair_change(
+            model(ModelTier.CODER),
+            make_tools(state["workspace"], writable=True),
+            state["ticket"],
+            state["plan"],
+            state["instructions"],
+            problems,
+            state["workspace"].diff(),
+            cfg.repair_max_steps,
+        )
+        record = {"reason": reason, "steps": loop.steps, "finished": loop.finished}
+        if loop.error:
+            record["error"] = loop.error
+        return {
+            "repair_attempts": state.get("repair_attempts", 0) + 1,
+            "repairs": [*state.get("repairs", []), record],
+        }
 
     def report(state: RunState) -> RunState:
-        write_report(cfg, state)
-        return {}
+        status = final_status(state)
+        write_report(cfg, {**state, "status": status})
+        return {"status": status}
+
+    def after_plan(state: RunState) -> str:
+        return "report" if state.get("status") == "error" else "implement"
+
+    def can_repair(state: RunState) -> bool:
+        return state.get("repair_attempts", 0) < cfg.max_repair_attempts
+
+    def after_validate(state: RunState) -> str:
+        if not state.get("changed_files"):
+            return "report"
+        if state.get("checks_passed"):
+            return "review"
+        return "repair" if can_repair(state) else "report"
+
+    def after_review(state: RunState) -> str:
+        result = state.get("review")
+        if result is None or result.approved:
+            return "report"
+        return "repair" if can_repair(state) else "report"
 
     graph = StateGraph(RunState)
-    graph.add_node("prepare_workspace", prepare_workspace)
-    graph.add_node("plan", plan)
-    graph.add_node("implement", implement)
-    graph.add_node("validate", validate)
-    graph.add_node("report", report)
+    for name, node in [
+        ("prepare_workspace", prepare_workspace),
+        ("plan", plan),
+        ("implement", implement),
+        ("validate", validate),
+        ("review", review),
+        ("repair", repair),
+        ("report", report),
+    ]:
+        graph.add_node(name, node)
     graph.add_edge(START, "prepare_workspace")
     graph.add_edge("prepare_workspace", "plan")
     graph.add_conditional_edges("plan", after_plan, ["implement", "report"])
     graph.add_edge("implement", "validate")
-    graph.add_edge("validate", "report")
+    graph.add_conditional_edges("validate", after_validate, ["review", "repair", "report"])
+    graph.add_conditional_edges("review", after_review, ["repair", "report"])
+    graph.add_edge("repair", "validate")
     graph.add_edge("report", END)
     return graph.compile()
+
+
+def final_status(state: RunState) -> Status:
+    if state.get("status") == "error":
+        return "error"
+    if not state.get("changed_files"):
+        return "no_changes"
+    if not state.get("checks_passed"):
+        return "validation_failed"
+    result = state.get("review")
+    if result is None:
+        return "error"  # review itself failed
+    return "approved" if result.approved else "changes_requested"
+
+
+def _failed_checks(results: list[CommandResult]) -> str:
+    parts = [
+        f"`{r.command}` failed (exit {r.exit_code}):\n```\n{r.output[-3000:]}\n```"
+        for r in results
+        if not r.ok
+    ]
+    return "Automated checks failed:\n\n" + "\n\n".join(parts)
+
+
+def _blocking_findings(result: Review) -> str:
+    lines = [
+        f"- [{f.severity}] {f.file}: {f.issue} Suggested fix: {f.suggestion}"
+        for f in result.blocking
+    ]
+    return "A code review requested changes:\n\n" + "\n".join(lines)
 
 
 def metrics(log: CallLog) -> dict[str, Any]:
@@ -154,6 +267,7 @@ def write_report(cfg: RunConfig, state: RunState) -> dict[str, Any]:
     diff = ws.diff()
     (cfg.run_dir / "changes.diff").write_text(diff)
     plan = state.get("plan")
+    review = state.get("review")
     data = {
         "ticket": state["ticket"].model_dump(),
         "status": state.get("status"),
@@ -166,7 +280,9 @@ def write_report(cfg: RunConfig, state: RunState) -> dict[str, Any]:
             "steps": state.get("implement_steps"),
             "tool_calls": state.get("tool_calls", []),
         },
+        "repairs": state.get("repairs", []),
         "validation": [asdict(r) for r in state.get("validation", [])],
+        "review": review.model_dump() | {"approved": review.approved} if review else None,
         "metrics": metrics(cfg.call_log),
         "llm_attempts": [asdict(r) for r in cfg.call_log.records],
     }

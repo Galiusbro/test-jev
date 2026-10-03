@@ -40,6 +40,15 @@ def test_copy_is_isolated_and_skips_venv(ws: Workspace, source: Path) -> None:
     assert (source / "app" / "main.py").read_text().startswith("def hello")
 
 
+def test_build_artifacts_are_not_changes(ws: Workspace) -> None:
+    (ws.root / "app" / "__pycache__").mkdir()
+    (ws.root / "app" / "__pycache__" / "main.cpython-312.pyc").write_bytes(b"x")
+    (ws.root / ".venv").mkdir()
+    (ws.root / ".venv" / "pyvenv.cfg").write_text("x")
+    (ws.root / ".pytest_cache").mkdir()
+    assert ws.changed_files() == [] and ws.diff() == ""
+
+
 def test_diff_and_changed_files(ws: Workspace) -> None:
     assert ws.diff() == "" and ws.changed_files() == []
     (ws.root / "app" / "main.py").write_text("def hello():\n    return 'hey'\n")
@@ -117,8 +126,9 @@ def test_load_instructions_errors(tmp_path: Path) -> None:
 
 
 def test_demo_api_instructions_parse() -> None:
-    commands = load_instructions(Path(__file__).parents[1] / "demo-api").commands
-    assert list(commands) == ["test", "lint", "format", "typecheck"]
+    instructions = load_instructions(Path(__file__).parents[1] / "demo-api")
+    assert list(instructions.commands) == ["test", "lint", "format", "typecheck"]
+    assert list(instructions.autofix) == ["format", "lint-fix"]
 
 
 def test_load_ticket(tmp_path: Path) -> None:
@@ -130,3 +140,19 @@ def test_load_ticket(tmp_path: Path) -> None:
     path.write_text("no heading")
     with pytest.raises(ValueError):
         load_ticket(path)
+
+
+def test_edits_that_break_python_syntax_are_rejected(ws: Workspace) -> None:
+    write, replace = tool(ws, "write_file"), tool(ws, "replace_in_file")
+    before = (ws.root / "app" / "main.py").read_text()
+
+    result = replace.invoke(
+        {"path": "app/main.py", "old": "    return 'hi'", "new": "  return 'hi'\n    x"}
+    )
+    assert result.startswith("ERROR: edit rejected") and "line" in result
+    assert (ws.root / "app" / "main.py").read_text() == before
+
+    assert write.invoke({"path": "app/new.py", "content": "def f(:\n"}).startswith("ERROR")
+    assert not (ws.root / "app" / "new.py").exists()
+    # non-Python files are not syntax-checked
+    assert write.invoke({"path": "notes.md", "content": "def f(:"}).startswith("wrote")

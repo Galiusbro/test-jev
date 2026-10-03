@@ -13,9 +13,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-_IGNORE = shutil.ignore_patterns(
-    ".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "*.pyc"
-)
+_JUNK = (".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "*.pyc")
+_IGNORE = shutil.ignore_patterns(".git", *_JUNK)
 
 
 def _clean_env() -> dict[str, str]:
@@ -52,6 +51,9 @@ class Workspace:
         shutil.copytree(source, repo, ignore=_IGNORE)
         ws = cls(repo)
         ws._git("init", "-q", "-b", "base")
+        # Validation creates caches and venvs; they are not part of the change.
+        (repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (repo / ".git" / "info" / "exclude").write_text("\n".join(_JUNK) + "\n")
         ws._git("add", "-A")
         ws._git("commit", "-q", "-m", "baseline", "--no-gpg-sign")
         return ws

@@ -469,3 +469,49 @@ def test_api_tool_call_name_case_fixed() -> None:
     )
     result = make(["a"]).with_structured_output(ReadFile).invoke("x")
     assert result == ReadFile(path="a.py")
+
+
+@respx.mock
+def test_failed_model_cools_down_for_next_calls() -> None:
+    route = respx.post(URL).mock(
+        side_effect=by_model(
+            {
+                "flaky": lambda: httpx.Response(200, content=sse(finish("stop", "flaky"))),
+                "steady": ok(delta("steady", content="ok")),
+            }
+        )
+    )
+    llm = make(["flaky", "steady"])
+    for _ in range(5):
+        assert llm.invoke("x").content == "ok"
+    tried = [json.loads(c.request.content)["model"] for c in route.calls]
+    # flaky fails, sits out calls 2-4, is tried first again on call 5
+    assert tried == ["flaky", "steady", "steady", "steady", "steady", "flaky", "steady"]
+
+
+@respx.mock
+def test_leaked_channel_tokens_stripped_from_tool_name() -> None:
+    respx.post(URL).mock(
+        side_effect=by_model(
+            {
+                "a": ok(
+                    delta(
+                        "a",
+                        tool_calls=[
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {
+                                    "name": "ReadFile<|channel|>commentary",
+                                    "arguments": '{"path": "a.py"}',
+                                },
+                            }
+                        ],
+                    )
+                )
+            }
+        )
+    )
+    message = make(["a"]).bind_tools([ReadFile]).invoke("x")
+    assert isinstance(message, AIMessage)
+    assert message.tool_calls[0]["name"] == "ReadFile"

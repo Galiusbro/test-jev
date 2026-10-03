@@ -34,6 +34,13 @@ docs/api.md    # public API reference — update when behaviour changes
 - format: `uv run ruff format --check .`
 - typecheck: `uv run mypy src tests`
 
+## Autofix
+
+Run automatically before validation; agents don't need to format by hand.
+
+- format: `uv run ruff format .`
+- lint-fix: `uv run ruff check --fix --quiet . || true`
+
 ## Allowed
 
 - Modify application code under `src/demo_api/`

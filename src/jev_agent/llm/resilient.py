@@ -26,7 +26,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from pydantic import ConfigDict, Field, SecretStr
+from pydantic import ConfigDict, Field, PrivateAttr, SecretStr
 
 from jev_agent.config import Reasoning
 from jev_agent.llm.reasoning import reasoning_params
@@ -148,8 +148,9 @@ class _Stream:
             return
         by_lower = {name.lower(): name for name in tool_names}
         for slot in self.tool_calls.values():
-            if slot["name"] not in tool_names:
-                slot["name"] = by_lower.get(slot["name"].lower(), slot["name"])
+            # gpt-oss can leak its channel tokens: "replace_in_file<|channel|>commentary"
+            name = slot["name"].split("<|")[0].strip()
+            slot["name"] = name if name in tool_names else by_lower.get(name.lower(), name)
         if self.tool_calls:
             return
         calls = _parse_text_tool_calls("".join(self.content), tool_names)
@@ -242,13 +243,25 @@ class ResilientChatModel(BaseChatModel):
     # and walk it again.
     chain_passes: int = Field(default=2, ge=1)
     retry_pause_s: float = 2.0
+    # A model that just failed goes to the back of the chain for this many calls,
+    # so a stuck model isn't retried first on every step of a long loop.
+    cooldown_calls: int = 3
     call_log: CallLog = Field(default_factory=CallLog, exclude=True)
     clock: Callable[[], float] = Field(default=time.perf_counter, exclude=True)
     sleep: Callable[[float], None] = Field(default=time.sleep, exclude=True)
 
+    _cooldown: dict[str, int] = PrivateAttr(default_factory=dict)
+
     @property
     def _llm_type(self) -> str:
         return "resilient-nvidia"
+
+    def _chain(self) -> list[str]:
+        ready = [m for m in self.models if self._cooldown.get(m, 0) <= 0]
+        cooling = [m for m in self.models if self._cooldown.get(m, 0) > 0]
+        for m in cooling:
+            self._cooldown[m] -= 1
+        return ready + cooling
 
     @property
     def _identifying_params(self) -> dict[str, Any]:
@@ -299,7 +312,7 @@ class ResilientChatModel(BaseChatModel):
             for attempt in range(self.chain_passes):
                 if attempt:
                     self.sleep(self.retry_pause_s)
-                for model in self.models:
+                for model in self._chain() if attempt == 0 else self.models:
                     start = self.clock()
                     stream = _Stream()
                     try:
@@ -307,6 +320,7 @@ class ResilientChatModel(BaseChatModel):
                     except _ModelUnavailable as exc:
                         failures.append(f"{model}: {exc}")
                         self._record(model, start, stream, error=str(exc))
+                        self._cooldown[model] = self.cooldown_calls
                         continue
                     self._record(model, start, stream)
                     stream.normalize_tool_calls(tool_names)

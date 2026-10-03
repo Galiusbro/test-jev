@@ -38,7 +38,7 @@ Agent instructions: [AGENTS.md](AGENTS.md).
 - [x] M1 — skeleton, Jev + NVIDIA clients, demo-api, CI
 - [x] M2 — linear happy path (ticket → context → plan → implement → validate)
 - [ ] M3 — policy engine from AGENTS.md, capabilities, approval interrupts
-- [ ] M4 — bounded repair, regression proof, review agent, PR
+- [x] M4 — bounded repair, autofix, review agent (regression proof + PR still to do)
 - [ ] M5 — Jev decision fabric + model router
 - [ ] M6 — LangSmith tracing, evals, experiments
 - [ ] M7 — `jev-agent init`, MCP server, demo script
