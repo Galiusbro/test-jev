@@ -38,7 +38,9 @@ class Settings(BaseSettings):
     # No token within this window = stuck in the queue; move to the next model.
     llm_first_token_timeout_s: float = Field(default=15.0, gt=0)
     llm_total_timeout_s: float = Field(default=180.0, gt=0)
-    llm_max_tokens: int = Field(default=4096, gt=0)
+    # Room for full-file writes and for reasoning models' thinking.
+    llm_max_tokens: int = Field(default=8192, gt=0)
+    llm_chain_passes: int = Field(default=2, ge=1)
 
     # Jev via the TypeSafe API (console.typesafe.ai).
     typesafe_api_key: SecretStr | None = None

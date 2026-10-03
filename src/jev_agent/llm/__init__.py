@@ -44,6 +44,7 @@ def chat_model(
         max_tokens=settings.llm_max_tokens,
         first_token_timeout_s=settings.llm_first_token_timeout_s,
         total_timeout_s=settings.llm_total_timeout_s,
+        chain_passes=settings.llm_chain_passes,
         call_log=call_log or CallLog(),
     )
 

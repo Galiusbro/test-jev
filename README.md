@@ -21,6 +21,7 @@ uv run jev-agent doctor
 | `jev-agent doctor` | Checks keys; one live call per model tier (shows fallbacks) and to Jev |
 | `jev-agent models [pattern]` | Lists NVIDIA models your key can use |
 | `jev-agent bench [models…] -n 3` | Median latency + tool-call success per model (default: shortlist) |
+| `jev-agent run tickets/001-….md [--repo demo-api]` | Ticket → plan → implement → validate on a copy; writes `runs/<id>/report.json` + `changes.diff` |
 | `jev-agent ask "Question?" -s '<state>'` | One yes/no Jev decision — for tuning question wording |
 
 ## Development
@@ -35,7 +36,7 @@ Agent instructions: [AGENTS.md](AGENTS.md).
 ## Status
 
 - [x] M1 — skeleton, Jev + NVIDIA clients, demo-api, CI
-- [ ] M2 — linear happy path (ticket → context → plan → implement → validate)
+- [x] M2 — linear happy path (ticket → context → plan → implement → validate)
 - [ ] M3 — policy engine from AGENTS.md, capabilities, approval interrupts
 - [ ] M4 — bounded repair, regression proof, review agent, PR
 - [ ] M5 — Jev decision fabric + model router

@@ -64,6 +64,7 @@ def make(
         base_url=BASE,
         reasoning=reasoning,
         first_token_timeout_s=15,
+        sleep=lambda _s: None,
         **extra,
     )
 
@@ -342,3 +343,129 @@ def test_chat_model_from_settings() -> None:
 def test_chat_model_requires_key() -> None:
     with pytest.raises(LLMConfigError, match="NVIDIA_API_KEY"):
         chat_model(ModelTier.FAST, Settings(_env_file=None))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[[{"name": "ReadFile", "parameters": {"path": "a.py"}}]]',
+        '{"name": "ReadFile", "arguments": {"path": "a.py"}}',
+        '```json\n{"name": "ReadFile", "arguments": "{\\"path\\": \\"a.py\\"}"}\n```',
+        '<tool_call>{"name": "ReadFile", "parameters": {"path": "a.py"}}</tool_call>',
+    ],
+)
+@respx.mock
+def test_tool_call_written_as_text_is_recovered(text: str) -> None:
+    respx.post(URL).mock(side_effect=by_model({"a": ok(delta("a", content=text))}))
+    message = make(["a"]).bind_tools([ReadFile]).invoke("open a.py")
+    assert isinstance(message, AIMessage)
+    assert message.content == ""
+    assert message.tool_calls == [
+        {"name": "ReadFile", "args": {"path": "a.py"}, "id": "text_call_0", "type": "tool_call"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'I will call {"name": "ReadFile", "parameters": {"path": "a.py"}} next.',  # prose
+        '{"name": "DeleteRepo", "parameters": {}}',  # unknown tool
+        '[{"name": "ReadFile", "parameters": {"path": "a"}}, {"name": "Nope"}]',  # mixed
+        '{"name": "ReadFile", "parameters": "not json"}',
+        '{"name": "ReadFile", "parameters": [1, 2]}',
+    ],
+)
+@respx.mock
+def test_text_that_is_not_a_clean_tool_call_stays_text(text: str) -> None:
+    respx.post(URL).mock(side_effect=by_model({"a": ok(delta("a", content=text))}))
+    message = make(["a"]).bind_tools([ReadFile]).invoke("x")
+    assert isinstance(message, AIMessage)
+    assert message.tool_calls == [] and message.content == text
+
+
+@respx.mock
+def test_no_recovery_without_tools() -> None:
+    text = '{"name": "ReadFile", "parameters": {"path": "a.py"}}'
+    respx.post(URL).mock(side_effect=by_model({"a": ok(delta("a", content=text))}))
+    message = make(["a"]).invoke("x")
+    assert message.content == text
+
+
+@respx.mock
+def test_second_pass_after_whole_chain_failed() -> None:
+    responses = iter(
+        [
+            httpx.Response(503),
+            httpx.Response(503),
+            httpx.Response(200, content=sse(delta("a", content="back"))),
+        ]
+    )
+    respx.post(URL).mock(side_effect=lambda _r: next(responses))
+    pauses: list[float] = []
+    llm = make(["a", "b"])
+    llm.sleep = pauses.append
+    assert llm.invoke("x").content == "back"
+    assert pauses == [2.0]
+    assert [r.ok for r in llm.call_log.records] == [False, False, True]
+
+
+@respx.mock
+def test_first_token_timeout_grows_with_prompt_size() -> None:
+    respx.post(URL).mock(
+        side_effect=by_model(
+            {
+                "a": lambda: httpx.Response(200, content=sse(delta("a", content="x"), comments=1)),
+            }
+        )
+    )
+    # 16s without a token: too slow for a short prompt, fine for a ~20k-token one.
+    for prompt, expect_ok in (("short", False), ("y" * 80_000, True)):
+        ticks = itertools.chain([0.0, 16.0], itertools.repeat(16.0))
+        llm = make(["a"], clock=lambda t=ticks: next(t))  # type: ignore[misc]
+        llm.chain_passes = 1
+        if expect_ok:
+            assert llm.invoke(prompt).content == "x"
+        else:
+            with pytest.raises(LLMError, match="no tokens in 15s"):
+                llm.invoke(prompt)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[[{"name": "ReadFile", "parameters": {"path": "a.py"}}]',  # Nemotron: [[ ... ]
+        '[[{"name": "readfile", "parameters": {"path": "a.py"}}]]',  # wrong case
+        '{"name": "ReadFile", "parameters": {"path": "a]}.py"}',  # brackets inside a string
+    ],
+)
+@respx.mock
+def test_unbalanced_or_miscased_text_tool_call_recovered(text: str) -> None:
+    respx.post(URL).mock(side_effect=by_model({"a": ok(delta("a", content=text))}))
+    message = make(["a"]).bind_tools([ReadFile]).invoke("x")
+    assert isinstance(message, AIMessage)
+    assert [tc["name"] for tc in message.tool_calls] == ["ReadFile"]
+    assert message.tool_calls[0]["args"]["path"] in ("a.py", "a]}.py")
+
+
+@respx.mock
+def test_api_tool_call_name_case_fixed() -> None:
+    respx.post(URL).mock(
+        side_effect=by_model(
+            {
+                "a": ok(
+                    delta(
+                        "a",
+                        tool_calls=[
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {"name": "readfile", "arguments": '{"path": "a.py"}'},
+                            }
+                        ],
+                    )
+                )
+            }
+        )
+    )
+    result = make(["a"]).with_structured_output(ReadFile).invoke("x")
+    assert result == ReadFile(path="a.py")

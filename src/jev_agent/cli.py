@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated
+import time
+from pathlib import Path
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from jev_agent.agents import StructuredOutputError
 from jev_agent.bench import CANDIDATES, run_bench
 from jev_agent.config import ModelTier, get_settings
 from jev_agent.decisions import (
@@ -19,7 +22,9 @@ from jev_agent.decisions import (
     ScoreQuestion,
 )
 from jev_agent.decisions.client import State
+from jev_agent.graph import RunConfig, build_graph
 from jev_agent.llm import CallLog, LLMConfigError, LLMError, chat_model, list_models
+from jev_agent.tickets import load_ticket
 
 app = typer.Typer(help="Controlled ticket-to-PR agent.", no_args_is_help=True)
 console = Console()
@@ -79,6 +84,56 @@ def doctor() -> None:
         console.print(f"[red]✗[/] Jev: {exc}")
 
     raise typer.Exit(0 if ok else 1)
+
+
+@app.command()
+def run(
+    ticket_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="Ticket .md")],
+    repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("demo-api"),
+    runs_dir: Annotated[Path, typer.Option()] = Path("runs"),
+) -> None:
+    """Run the ticket-to-diff workflow on a copy of REPO."""
+    settings = get_settings()
+    ticket = load_ticket(ticket_path)
+    run_dir = runs_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{ticket.id}"
+    run_dir.mkdir(parents=True)
+    cfg = RunConfig(
+        repo=repo,
+        run_dir=run_dir,
+        models=lambda tier, log: chat_model(tier, settings, call_log=log),
+    )
+    console.print(f"[bold]{ticket.title}[/] → {run_dir}")
+    state: dict[str, Any] = {"ticket": ticket, "started_at": time.time()}
+    try:
+        for update in build_graph(cfg).stream(state, stream_mode="updates"):
+            for node, delta in update.items():
+                state.update(delta or {})
+                console.print(f"  [green]✓[/] {node}{_describe(node, state)}")
+    except (LLMError, LLMConfigError, StructuredOutputError) as exc:
+        console.print(f"  [red]✗[/] {exc}")
+        raise typer.Exit(1) from exc
+    status = state.get("status")
+    color = "green" if status == "validated" else "red"
+    if error := state.get("error"):
+        console.print(f"  [red]{error}[/]")
+    console.print(f"[{color}]{status}[/] · report: {run_dir / 'report.json'}")
+    raise typer.Exit(0 if status == "validated" else 1)
+
+
+def _describe(node: str, state: dict[str, Any]) -> str:
+    if node == "prepare_workspace" and (setup := state.get("setup")) and not setup.ok:
+        return f" [yellow](setup failed: {setup.output[-200:]})[/]"
+    if node == "plan":
+        if "plan" not in state:
+            return " [red]failed[/]"
+        plan = state["plan"]
+        return f": {plan.summary} [dim](risk={plan.risk}, files={plan.files_to_change})[/]"
+    if node == "implement":
+        done = "" if state["implement_finished"] else " [yellow]did not finish[/]"
+        return f": {state['implement_steps']} steps, changed {state['changed_files']}{done}"
+    if node == "validate":
+        return ": " + ", ".join(f"{'✓' if r.ok else '✗'} {r.command}" for r in state["validation"])
+    return ""
 
 
 @app.command()

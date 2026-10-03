@@ -10,6 +10,7 @@ abandoned for the next model in the chain. Each attempt is recorded in a
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -135,6 +136,94 @@ class _Stream:
     def empty(self) -> bool:
         return not "".join(self.content).strip() and not self.tool_calls
 
+    def normalize_tool_calls(self, tool_names: set[str]) -> None:
+        """Repair tool calls that open models get slightly wrong.
+
+        - Names in the wrong case (gpt-oss sends `plan` for `Plan`).
+        - Calls written as text instead of via the tools API, e.g.
+          `[{"name": "Plan", "parameters": {...}}]` (Nemotron). Only replies
+          that are entirely such JSON, naming a provided tool, are converted.
+        """
+        if not tool_names:
+            return
+        by_lower = {name.lower(): name for name in tool_names}
+        for slot in self.tool_calls.values():
+            if slot["name"] not in tool_names:
+                slot["name"] = by_lower.get(slot["name"].lower(), slot["name"])
+        if self.tool_calls:
+            return
+        calls = _parse_text_tool_calls("".join(self.content), tool_names)
+        if calls:
+            self.content = []
+            for index, (name, args) in enumerate(calls):
+                self.tool_calls[index] = {
+                    "id": f"text_call_{index}",
+                    "name": name,
+                    "arguments": json.dumps(args),
+                }
+
+
+_FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+_TAG = re.compile(r"^<tool_call>\s*(.*?)\s*</tool_call>$", re.DOTALL)
+
+
+def _parse_text_tool_calls(text: str, tool_names: set[str]) -> list[tuple[str, dict[str, Any]]]:
+    body = text.strip()
+    for pattern in (_FENCE, _TAG):
+        if match := pattern.match(body):
+            body = match.group(1).strip()
+    try:
+        data = json.loads(body)
+    except ValueError:
+        try:
+            data = json.loads(_close_brackets(body))
+        except ValueError:
+            return []
+    by_lower = {name.lower(): name for name in tool_names}
+    while isinstance(data, list) and len(data) == 1 and isinstance(data[0], list):
+        data = data[0]  # [[{...}]] seen from Nemotron
+    items = data if isinstance(data, list) else [data]
+    calls: list[tuple[str, dict[str, Any]]] = []
+    for item in items:
+        name = by_lower.get(str(item.get("name", "")).lower()) if isinstance(item, dict) else None
+        if name is None:
+            return []
+        args = item.get("parameters", item.get("arguments", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                return []
+        if not isinstance(args, dict):
+            return []
+        calls.append((name, args))
+    return calls
+
+
+def _close_brackets(text: str) -> str:
+    """Append the closers a truncated or unbalanced JSON value is missing.
+
+    Nemotron sometimes opens with `[[` and closes with a single `]`.
+    """
+    closers = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    in_string = escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in closers:
+            stack.append(closers[char])
+        elif char in "}]" and stack and stack[-1] == char:
+            stack.pop()
+    return text + "".join(reversed(stack))
+
 
 class ResilientChatModel(BaseChatModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -145,10 +234,17 @@ class ResilientChatModel(BaseChatModel):
     reasoning: Reasoning = "default"
     temperature: float = 0.0
     max_tokens: int = 4096
+    # Base wait for the first token; long prompts get +1s per ~2k tokens because
+    # prefill alone takes longer.
     first_token_timeout_s: float = 15.0
     total_timeout_s: float = 180.0
+    # Free-tier failures are usually brief: after the whole chain fails, pause
+    # and walk it again.
+    chain_passes: int = Field(default=2, ge=1)
+    retry_pause_s: float = 2.0
     call_log: CallLog = Field(default_factory=CallLog, exclude=True)
     clock: Callable[[], float] = Field(default=time.perf_counter, exclude=True)
+    sleep: Callable[[float], None] = Field(default=time.sleep, exclude=True)
 
     @property
     def _llm_type(self) -> str:
@@ -194,21 +290,28 @@ class ResilientChatModel(BaseChatModel):
             if kwargs.get(key):
                 payload[key] = kwargs[key]
 
-        timeout = httpx.Timeout(10.0, read=self.first_token_timeout_s)
+        first_token = self.first_token_timeout_s + len(json.dumps(payload["messages"])) / 8000
+        timeout = httpx.Timeout(10.0, read=first_token)
         headers = {"Authorization": f"Bearer {self.api_key.get_secret_value()}"}
+        tool_names = {t["function"]["name"] for t in payload.get("tools", [])}
         failures: list[str] = []
         with httpx.Client(base_url=self.base_url, timeout=timeout, headers=headers) as http:
-            for model in self.models:
-                start = self.clock()
-                stream = _Stream()
-                try:
-                    self._stream_one(http, model, payload, stream, start)
-                except _ModelUnavailable as exc:
-                    failures.append(f"{model}: {exc}")
-                    self._record(model, start, stream, error=str(exc))
-                    continue
-                self._record(model, start, stream)
-                return ChatResult(generations=[ChatGeneration(message=stream.to_message())])
+            for attempt in range(self.chain_passes):
+                if attempt:
+                    self.sleep(self.retry_pause_s)
+                for model in self.models:
+                    start = self.clock()
+                    stream = _Stream()
+                    try:
+                        self._stream_one(http, model, payload, stream, start, first_token)
+                    except _ModelUnavailable as exc:
+                        failures.append(f"{model}: {exc}")
+                        self._record(model, start, stream, error=str(exc))
+                        continue
+                    self._record(model, start, stream)
+                    stream.normalize_tool_calls(tool_names)
+                    message = stream.to_message()
+                    return ChatResult(generations=[ChatGeneration(message=message)])
         raise LLMError("all models failed — " + "; ".join(failures))
 
     def _stream_one(
@@ -218,6 +321,7 @@ class ResilientChatModel(BaseChatModel):
         payload: dict[str, Any],
         stream: _Stream,
         start: float,
+        first_token_timeout_s: float,
     ) -> None:
         body = {**payload, "model": model, **reasoning_params(model, self.reasoning)}
         try:
@@ -232,8 +336,8 @@ class ResilientChatModel(BaseChatModel):
                     )
                 for line in response.iter_lines():
                     elapsed = self.clock() - start
-                    if stream.first_token_s is None and elapsed > self.first_token_timeout_s:
-                        raise _ModelUnavailable(f"no tokens in {self.first_token_timeout_s:.0f}s")
+                    if stream.first_token_s is None and elapsed > first_token_timeout_s:
+                        raise _ModelUnavailable(f"no tokens in {first_token_timeout_s:.0f}s")
                     if elapsed > self.total_timeout_s:
                         raise _ModelUnavailable(f"total timeout {self.total_timeout_s:.0f}s")
                     if not line.startswith("data:"):
