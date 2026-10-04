@@ -31,6 +31,24 @@ def test_short_password_rejected(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_create_user_whitespace(client: TestClient) -> None:
+    response = client.post(
+        "/users", json={"email": "ada@example.com", "name": "  Ada  ", "password": "longenough"}
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["name"] == "Ada"
+
+
+def test_create_user_empty_name(client: TestClient) -> None:
+    response = client.post(
+        "/users", json={"email": "empty@example.com", "name": "   ", "password": "longenough"}
+    )
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert any(err["loc"] == ["body", "name"] for err in errors)
+
+
 def test_unknown_user_404(client: TestClient) -> None:
     assert client.get("/users/999").status_code == 404
 
