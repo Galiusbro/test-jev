@@ -534,3 +534,22 @@ def test_jev_disputed_finding_does_not_trigger_repair(repo: Path, tmp_path: Path
     assert state["status"] == "approved"
     assert state["repair_attempts"] == 0
     assert state["review"].findings[0].issue.startswith("[disputed by Jev]")
+
+
+def test_run_agent_full_step_budget_with_jev_middleware(tmp_path: Path, repo: Path) -> None:
+    """A 30-step run must end at the step budget, not at LangGraph's recursion limit."""
+    from jev_agent.harness import JevWriteGateMiddleware
+    from jev_agent.policy import Policy
+
+    ws = Workspace.create(repo, tmp_path / "run")
+    gate = JevWriteGateMiddleware(
+        decisions=jev_ok(),
+        policy=Policy([]),
+        workspace=ws,
+        ticket_title="t",
+        plan_summary="p",
+    )
+    model = ScriptedChatModel(replies=[call("list_files", f"l{i}") for i in range(31)])
+    result = run_agent(model, make_tools(ws, writable=True), "system", "go", 30, [gate])
+    assert result.error is None
+    assert (result.steps, result.finished) == (30, False)

@@ -42,6 +42,7 @@ from langchain_typesafe.experimental.middleware.model_router import (
     ModelChoice,
     _ModelRouterConfig,
 )
+from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
 from jev_agent.decisions.fabric import Decisions
@@ -292,13 +293,17 @@ def run_agent(
         tracker,
     ]
     agent = create_agent(model, tools=list(tools), system_prompt=system_prompt, middleware=stack)
-    # Each step is a model node plus a tools node, with middleware nodes around.
-    config: RunnableConfig = {"recursion_limit": max_steps * 4 + 20}
+    # The step budget is ModelCallLimitMiddleware's job. Every middleware hook is
+    # its own graph node (~6 super-steps per model call here), so the recursion
+    # limit is only a generous backstop against a looping graph.
+    config: RunnableConfig = {"recursion_limit": max_steps * 12 + 50}
     request: Any = {"messages": [HumanMessage(task)]}
     try:
         state = agent.invoke(request, config)
     except LLMError as exc:
         return LoopResult([], tracker.steps, False, tracker.tool_calls, error=str(exc))
+    except GraphRecursionError as exc:
+        return LoopResult([], tracker.steps, False, tracker.tool_calls, error=f"graph: {exc}")
     route = state.get("model_route")
     return LoopResult(
         list(state["messages"]),
