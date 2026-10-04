@@ -4,21 +4,16 @@ from __future__ import annotations
 
 import json
 import sys
-import time
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from langchain_core.runnables import RunnableConfig
-from langchain_core.tracers.context import collect_runs
 from rich.console import Console
 from rich.prompt import Confirm
 from rich.table import Table
 
-from jev_agent.agents import StructuredOutputError
 from jev_agent.bench import CANDIDATES, run_bench
-from jev_agent.config import ModelTier, Settings, get_settings
+from jev_agent.config import ModelTier, get_settings
 from jev_agent.decisions import (
     BooleanQuestion,
     ChoiceQuestion,
@@ -27,12 +22,10 @@ from jev_agent.decisions import (
     TypeSafeJevClient,
 )
 from jev_agent.decisions.client import State
-from jev_agent.decisions.fabric import Decisions
-from jev_agent.graph import RunConfig, build_graph
+from jev_agent.evals import MODES, load_cases, read_results, run_series, summarize
 from jev_agent.llm import CallLog, LLMConfigError, LLMError, chat_model, list_models
-from jev_agent.observability import configure_tracing, flush, run_url
-from jev_agent.policy import ApprovalRequest, Approver
-from jev_agent.tickets import load_ticket
+from jev_agent.observability import configure_tracing
+from jev_agent.runner import Approvals, RunOutcome, execute_run, make_approver
 
 app = typer.Typer(help="Controlled ticket-to-PR agent.", no_args_is_help=True)
 console = Console()
@@ -106,12 +99,6 @@ def doctor() -> None:
     raise typer.Exit(0 if ok else 1)
 
 
-class Approvals(StrEnum):
-    ASK = "ask"
-    ALL = "all"
-    NONE = "none"
-
-
 @app.command()
 def run(
     ticket_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="Ticket .md")],
@@ -124,89 +111,81 @@ def run(
 ) -> None:
     """Run the ticket-to-diff workflow on a copy of REPO."""
     settings = get_settings()
-    ticket = load_ticket(ticket_path)
-    run_dir = runs_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{ticket.id}"
-    run_dir.mkdir(parents=True)
-    cfg = RunConfig(
+    ask = (
+        (lambda: Confirm.ask("    Approve?", default=False, console=console))
+        if sys.stdin.isatty()
+        else None
+    )
+
+    def started(outcome: RunOutcome) -> None:
+        console.print(
+            f"[bold]{ticket_path.stem}[/] → {outcome.run_dir} "
+            f"[dim](jev {'on' if outcome.jev_enabled else 'off'}, "
+            f"langsmith {'on' if outcome.tracing else 'off'})[/]"
+        )
+
+    outcome = execute_run(
+        ticket_path,
+        settings=settings,
         repo=repo,
-        run_dir=run_dir,
-        models=lambda tier, log: chat_model(tier, settings, call_log=log),
-        approver=_approver(approvals),
-        decisions=_decisions(settings, enabled=jev),
+        runs_dir=runs_dir,
+        approver=make_approver(approvals, log=console.print, ask=ask),
+        jev=jev,
+        tags=[f"approvals:{approvals.value}"],
+        on_start=started,
+        on_update=lambda node, state: console.print(
+            f"  [green]✓[/] {node}{_describe(node, state)}"
+        ),
     )
-    tracing = configure_tracing(settings)
-    console.print(
-        f"[bold]{ticket.title}[/] → {run_dir} "
-        f"[dim](jev {'on' if cfg.decisions.enabled else 'off'}, "
-        f"langsmith {'on' if tracing else 'off'})[/]"
-    )
-    state: dict[str, Any] = {"ticket": ticket, "started_at": time.time()}
-    config: RunnableConfig = {
-        "run_name": f"ticket {ticket.id}",
-        "tags": ["jev" if cfg.decisions.enabled else "no-jev", f"approvals:{approvals.value}"],
-        "metadata": {
-            "ticket": ticket.id,
-            "jev": cfg.decisions.enabled,
-            "run_dir": str(run_dir),
-            "models": {t.value: settings.models_for(t) for t in ModelTier},
-        },
-    }
-    try:
-        with collect_runs() as runs:
-            for update in build_graph(cfg).stream(state, config, stream_mode="updates"):
-                for node, delta in update.items():
-                    state.update(delta or {})
-                    console.print(f"  [green]✓[/] {node}{_describe(node, state)}")
-    except (LLMError, LLMConfigError, StructuredOutputError) as exc:
-        console.print(f"  [red]✗[/] {exc}")
-        raise typer.Exit(1) from exc
-    finally:
-        if tracing:
-            flush()
-    if (
-        tracing
-        and runs.traced_runs
-        and (url := run_url(runs.traced_runs[0], settings.langsmith_project))
-    ):
-        console.print(f"  [dim]trace:[/] {url}")
-        _add_to_report(run_dir, {"langsmith_url": url})
-    if policy := state.get("policy"):
+    if outcome.trace_url:
+        console.print(f"  [dim]trace:[/] {outcome.trace_url}")
+    if policy := outcome.state.get("policy"):
         for d in policy.audit:
             if d.verdict in ("deny", "rejected") and d.action != "plan":
                 console.print(f"  [red]policy blocked[/] {d.action} {d.target}: {d.reason}")
-    status = state.get("status")
-    color = "green" if status == "approved" else "red"
-    if error := state.get("error"):
+    color = "green" if outcome.status == "approved" else "red"
+    if error := outcome.report.get("error"):
         console.print(f"  [red]{error}[/]")
-    console.print(f"[{color}]{status}[/] · report: {run_dir / 'report.json'}")
-    raise typer.Exit(0 if status == "approved" else 1)
+    console.print(f"[{color}]{outcome.status}[/] · report: {outcome.run_dir / 'report.json'}")
+    raise typer.Exit(0 if outcome.status == "approved" else 1)
 
 
-def _decisions(settings: Settings, *, enabled: bool) -> Decisions:
-    if not enabled or settings.typesafe_api_key is None:
-        return Decisions(None)
-    return Decisions(TypeSafeJevClient.from_settings(settings), settings.jev_min_confidence)
+@app.command("eval")
+def eval_(
+    cases_file: Annotated[Path, typer.Option("--cases", exists=True)] = Path("evals/cases.json"),
+    only: Annotated[list[str] | None, typer.Option("--case", help="Case id; repeatable.")] = None,
+    modes: Annotated[list[str] | None, typer.Option("--mode", help="jev / no-jev")] = None,
+    repeats: Annotated[int, typer.Option(min=1)] = 1,
+    results: Annotated[Path, typer.Option()] = Path("evals/results/latest.jsonl"),
+    repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("demo-api"),
+    runs_dir: Annotated[Path, typer.Option()] = Path("runs"),
+) -> None:
+    """Run the eval cases in each mode; resumable (appends to RESULTS)."""
+    chosen = modes or list(MODES)
+    unknown = set(chosen) - set(MODES)
+    if unknown:
+        console.print(f"[red]unknown mode(s): {sorted(unknown)}; use {MODES}[/]")
+        raise typer.Exit(2)
+    cases = load_cases(cases_file, only or ())
+    run_series(
+        cases,
+        settings=get_settings(),
+        modes=chosen,
+        repeats=repeats,
+        results=results,
+        repo=repo,
+        runs_dir=runs_dir,
+        log=console.print,
+    )
+    console.print(summarize(read_results(results)))
 
 
-def _approver(mode: Approvals) -> Approver:
-    def decide(request: ApprovalRequest) -> bool:
-        reasons = "".join(f"\n      - {r}" for r in request.reasons)
-        console.print(f"  [yellow]approval needed[/] ({request.action}):{reasons}")
-        if mode is Approvals.ALL:
-            console.print("    [green]auto-approved[/] (--approvals all)")
-            return True
-        if mode is Approvals.NONE or not sys.stdin.isatty():
-            console.print("    [red]denied[/] (no interactive approval)")
-            return False
-        return Confirm.ask("    Approve?", default=False, console=console)
-
-    return decide
-
-
-def _add_to_report(run_dir: Path, fields: dict[str, Any]) -> None:
-    path = run_dir / "report.json"
-    if path.exists():
-        path.write_text(json.dumps(json.loads(path.read_text()) | fields, indent=2))
+@app.command("eval-report")
+def eval_report(
+    results: Annotated[Path, typer.Argument(exists=True)] = Path("evals/results/latest.jsonl"),
+) -> None:
+    """Print the summary tables for an eval results file (Markdown)."""
+    console.print(summarize(read_results(results)), markup=False, highlight=False)
 
 
 def _describe(node: str, state: dict[str, Any]) -> str:
