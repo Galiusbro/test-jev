@@ -172,9 +172,9 @@ def _describe(node: str, state: dict[str, Any]) -> str:
     if node == "validate":
         return ": " + ", ".join(f"{'✓' if r.ok else '✗'} {r.command}" for r in state["validation"])
     if node == "review":
-        if "review" not in state:
+        review = state.get("review")
+        if review is None:
             return f" [red]{state.get('error', 'failed')}[/]"
-        review = state["review"]
         verdict = "[green]approved[/]" if review.approved else "[yellow]changes requested[/]"
         lines = "".join(f"\n      [{f.severity}] {f.file}: {f.issue}" for f in review.findings)
         return f": {verdict} — {review.summary}{lines}"

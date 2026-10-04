@@ -299,7 +299,12 @@ class Finding(BaseModel):
     )
     file: str
     issue: str
-    suggestion: str
+    suggestion: str = ""
+    evidence: str = Field(
+        default="",
+        description="The exact line(s) copied from the diff that show the problem. "
+        "Required for blocker/major findings.",
+    )
 
 
 class Review(BaseModel):
@@ -317,6 +322,22 @@ class Review(BaseModel):
         # Decided by code from the findings, not by a model-reported flag.
         return not self.blocking
 
+    def grounded(self, diff: str) -> Review:
+        """Downgrade blocking findings whose evidence is not in the diff.
+
+        Reviewers hallucinate; a blocking finding must quote the code it is
+        about. Unsupported ones are kept for the record as `minor`.
+        """
+        haystack = _normalize(diff)
+        findings = []
+        for f in self.findings:
+            quoted = [_normalize(line) for line in f.evidence.splitlines() if line.strip()]
+            supported = bool(quoted) and all(q in haystack for q in quoted)
+            if f.severity in ("blocker", "major") and not supported:
+                f = f.model_copy(update={"severity": "minor", "issue": f"[unverified] {f.issue}"})
+            findings.append(f)
+        return self.model_copy(update={"findings": findings})
+
 
 _REVIEW_SYSTEM = """\
 You are an independent code reviewer. You did not write this change. Review
@@ -326,8 +347,10 @@ security problems, violations of the project conventions, and changes outside
 the ticket's scope. Automated tests, lint and type checks already pass.
 
 Report only real problems. Use `blocker`/`major` only for issues that must be
-fixed before merge; style preferences are `minor`. An empty findings list
-means approve.
+fixed before merge, and for those copy the exact diff line(s) that show the
+problem into `evidence` — findings without matching evidence are discarded as
+unverified. Style preferences are `minor`. An empty findings list means
+approve.
 
 Project rules (AGENTS.md):
 {rules}
@@ -340,7 +363,7 @@ def review_change(
     instructions: ProjectInstructions,
     diff: str,
 ) -> Review:
-    return structured(
+    review = structured(
         model,
         Review,
         [
@@ -349,7 +372,15 @@ def review_change(
                 f"Ticket:\n\n{ticket.as_text()}\n\nDiff:\n\n```diff\n{_clip(diff, 20_000)}\n```"
             ),
         ],
+        retries=2,
     )
+    return review.grounded(diff)
+
+
+def _normalize(text: str) -> str:
+    """Whitespace-insensitive form; strips diff markers so quotes match either way."""
+    lines = (line[1:] if line[:1] in "+- " else line for line in text.splitlines())
+    return " ".join(" ".join(lines).split())
 
 
 def _clip(text: str, limit: int) -> str:

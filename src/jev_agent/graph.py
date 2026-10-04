@@ -76,7 +76,7 @@ class RunState(TypedDict, total=False):
     autofix: list[CommandResult]
     validation: list[CommandResult]
     checks_passed: bool
-    review: Review
+    review: Review | None  # None: the latest review failed — never route on a stale one
     repair_attempts: int
     repairs: list[dict[str, Any]]
     status: Status
@@ -172,7 +172,7 @@ def build_graph(cfg: RunConfig) -> Any:
                 state["workspace"].diff(),
             )
         except (LLMError, StructuredOutputError) as exc:
-            return {"error": f"review failed: {exc}"}
+            return {"review": None, "error": f"review failed: {exc}"}
         return {"review": result}
 
     def repair(state: RunState) -> RunState:
@@ -181,7 +181,9 @@ def build_graph(cfg: RunConfig) -> Any:
             problems = _failed_checks(state.get("validation", []))
         else:
             reason = "review"
-            problems = _blocking_findings(state["review"])
+            current = state.get("review")
+            assert current is not None, "after_review only routes here with a review"
+            problems = _blocking_findings(current)
         loop = repair_change(
             model(ModelTier.CODER),
             writer_tools(state),

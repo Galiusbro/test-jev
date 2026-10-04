@@ -195,3 +195,31 @@ def test_tools_enforce_policy_with_normalized_paths(tmp_path: Path) -> None:
         )
         == "edited src/demo_api/auth.py"
     )
+
+
+def test_review_grounding() -> None:
+    from jev_agent.agents import Finding, Review
+
+    diff = (
+        "+    if limiter.is_blocked(ip):\n"
+        "+        raise HTTPException(429, 'Too many')\n"
+        "     return token\n"
+    )
+
+    def f(severity: str, evidence: str) -> Finding:
+        return Finding(severity=severity, file="a.py", issue="x", evidence=evidence)
+
+    review = Review(
+        summary="s",
+        findings=[
+            f("major", "if limiter.is_blocked(ip):"),  # quoted, whitespace differs
+            f("blocker", "+        raise HTTPException(429, 'Too many')"),  # with diff marker
+            f("major", "limiter.reset(ip)"),  # invented
+            f("major", ""),  # no evidence
+            f("minor", ""),  # minor needs none
+        ],
+    ).grounded(diff)
+    assert [x.severity for x in review.findings] == ["major", "blocker", "minor", "minor", "minor"]
+    assert review.findings[2].issue == "[unverified] x"
+    assert review.findings[4].issue == "x"
+    assert not review.approved

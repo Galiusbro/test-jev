@@ -78,8 +78,14 @@ APPROVE = call("Review", summary="Looks correct.", findings=[])
 FIX = call("replace_in_file", path="app/main.py", old="'hi'", new="'hello'")
 
 
-def finding(severity: str = "major") -> dict[str, str]:
-    return {"severity": severity, "file": "app/main.py", "issue": "Bad.", "suggestion": "Fix."}
+def finding(severity: str = "major", evidence: str = "return 'hello'") -> dict[str, str]:
+    return {
+        "severity": severity,
+        "file": "app/main.py",
+        "issue": "Bad.",
+        "suggestion": "Fix.",
+        "evidence": evidence,
+    }
 
 
 def test_happy_path_is_approved_and_writes_report(repo: Path, tmp_path: Path) -> None:
@@ -335,3 +341,30 @@ def test_approved_plan_proceeds_and_tool_denials_reach_the_model(
     assert "## Forbidden" in (tmp_path / "run" / "repo" / "AGENTS.md").read_text()
     verdicts = [d.verdict for d in state["policy"].audit]
     assert verdicts[0] == "approved" and "deny" in verdicts
+
+
+def test_ungrounded_blocking_finding_is_downgraded(repo: Path, tmp_path: Path) -> None:
+    invented = call("Review", summary="Resets the counter.", findings=[finding(evidence="reset()")])
+    state, _ = run(repo, tmp_path, [*planner_script(), invented], [FIX, say("done")])
+
+    assert state["status"] == "approved"  # nothing in the diff supports the claim
+    assert state["repair_attempts"] == 0
+    (kept,) = state["review"].findings
+    assert kept.severity == "minor" and kept.issue.startswith("[unverified]")
+
+
+def test_failed_review_never_routes_on_a_stale_verdict(repo: Path, tmp_path: Path) -> None:
+    from jev_agent.llm import LLMError
+
+    changes = call("Review", summary="Off by one.", findings=[finding("major")])
+    strong: list[AIMessage | Exception] = [
+        *planner_script(),
+        changes,
+        LLMError("all models failed"),  # second review fails
+    ]
+    coder = [FIX, say("done"), call("read_file", path="app/main.py"), say("addressed")]
+    state, _ = run(repo, tmp_path, strong, coder)
+
+    assert state["status"] == "error"
+    assert state["review"] is None
+    assert state["repair_attempts"] == 1  # no extra repair driven by the old review
