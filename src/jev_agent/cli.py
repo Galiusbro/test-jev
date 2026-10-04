@@ -25,6 +25,7 @@ from jev_agent.decisions.client import State
 from jev_agent.evals import MODES, load_cases, read_results, run_series, summarize
 from jev_agent.llm import CallLog, LLMConfigError, LLMError, chat_model, list_models
 from jev_agent.observability import configure_tracing
+from jev_agent.pr import PullRequestError, open_pull_request
 from jev_agent.runner import Approvals, RunOutcome, execute_run, make_approver
 
 app = typer.Typer(help="Controlled ticket-to-PR agent.", no_args_is_help=True)
@@ -108,6 +109,9 @@ def run(
         Approvals, typer.Option(help="ask: prompt (deny without a terminal); all; none")
     ] = Approvals.ASK,
     jev: Annotated[bool, typer.Option(help="Use Jev decisions (off = pre-Jev baseline)")] = True,
+    open_pr: Annotated[
+        bool, typer.Option(help="Open a GitHub PR for the target repo when the run is approved.")
+    ] = False,
 ) -> None:
     """Run the ticket-to-diff workflow on a copy of REPO."""
     settings = get_settings()
@@ -147,6 +151,18 @@ def run(
     if error := outcome.report.get("error"):
         console.print(f"  [red]{error}[/]")
     console.print(f"[{color}]{outcome.status}[/] · report: {outcome.run_dir / 'report.json'}")
+    if open_pr and outcome.status == "approved":
+        try:
+            url = open_pull_request(
+                target_repo=repo,
+                diff=(outcome.run_dir / "changes.diff").read_text(),
+                report=outcome.report,
+            )
+        except PullRequestError as exc:
+            console.print(f"[red]PR not opened:[/] {exc}")
+            raise typer.Exit(1) from exc
+        _add_to_report(outcome.run_dir, {"pull_request": url})
+        console.print(f"[green]pull request:[/] {url}")
     raise typer.Exit(0 if outcome.status == "approved" else 1)
 
 
@@ -190,6 +206,12 @@ def eval_report(
 ) -> None:
     """Print the summary tables for an eval results file (Markdown)."""
     console.print(summarize(read_results(results)), markup=False, highlight=False)
+
+
+def _add_to_report(run_dir: Path, fields: dict[str, Any]) -> None:
+    path = run_dir / "report.json"
+    if path.exists():
+        path.write_text(json.dumps(json.loads(path.read_text()) | fields, indent=2))
 
 
 def _describe(node: str, state: dict[str, Any]) -> str:
