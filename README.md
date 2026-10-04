@@ -4,7 +4,9 @@
 
 LangGraph orchestrates the workflow, **Jev** (TypeSafe API) makes typed
 decisions on its edges, free **NVIDIA API Catalog** models write the code, and
-plain Python enforces policy. Full design: [PROJECT_IDEA.md](PROJECT_IDEA.md).
+plain Python enforces policy. Full design: [PROJECT_IDEA.md](PROJECT_IDEA.md) ·
+results: [evaluation report](docs/evaluation-report.md) · walkthrough: [demo script](docs/demo.md) ·
+example output: [PR #1](https://github.com/Galiusbro/test-jev/pull/1).
 
 ## Setup
 
@@ -69,4 +71,4 @@ Agent instructions: [AGENTS.md](AGENTS.md).
 - [x] M4 — bounded repair, autofix, review agent, regression proof, GitHub PR (`--open-pr`)
 - [x] M5 — Jev decision fabric: triage, plan risk/complexity → approval + model choice, semantic write gate, failure diagnosis, review verification
 - [x] M6 — LangSmith tracing, eval harness, Jev vs no-Jev comparison → [evaluation report](docs/evaluation-report.md)
-- [x] M7 — `jev-agent init`, MCP server (demo script still to do)
+- [x] M7 — `jev-agent init`, MCP server, [demo script](docs/demo.md)
