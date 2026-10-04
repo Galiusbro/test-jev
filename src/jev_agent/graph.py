@@ -79,6 +79,9 @@ class RunConfig:
     implement_max_steps: int = 30
     repair_max_steps: int = 15
     max_repair_attempts: int = 3
+    # After this many failed repairs, repair on the strong chain regardless of
+    # the router: it only sees the task text, not that cheaper attempts failed.
+    escalate_after_repairs: int = 2
     setup_command: str | None = "uv sync --quiet"
     approver: Approver = deny_all
     decisions: Decisions = field(default_factory=lambda: Decisions(None))
@@ -321,8 +324,12 @@ def build_graph(cfg: RunConfig) -> Any:
             current = state.get("review")
             assert current is not None, "after_review only routes here with a review"
             problems = _blocking_findings(current)
+        escalate = state.get("repair_attempts", 0) >= cfg.escalate_after_repairs
+        middleware = coder_middleware(state)
+        if escalate:  # keep the write gate, drop the router: the model is decided
+            middleware = [m for m in middleware if not isinstance(m, JevModelRouter)]
         loop = repair_change(
-            model(ModelTier.CODER),
+            model(ModelTier.STRONG if escalate else ModelTier.CODER),
             writer_tools(state),
             state["ticket"],
             state["plan"],
@@ -330,13 +337,13 @@ def build_graph(cfg: RunConfig) -> Any:
             problems,
             state["workspace"].diff(),
             cfg.repair_max_steps,
-            coder_middleware(state),
+            middleware,
         )
         record: dict[str, Any] = {
             "reason": reason,
             "steps": loop.steps,
             "finished": loop.finished,
-            "model_route": loop.route or "coder",
+            "model_route": "strong (escalated)" if escalate else loop.route or "coder",
         }
         if loop.error:
             record["error"] = loop.error

@@ -605,3 +605,28 @@ def test_truncated_exploration_keeps_what_was_found(tmp_path: Path, repo: Path) 
     assert "Exploration stopped at the step limit" in notes
     assert "Files inspected: AGENTS.md, app/main.py" in notes
     assert "hello() is in app/main.py" in notes
+
+
+def test_repairs_escalate_to_the_strong_model_after_two_failures(
+    repo: Path, tmp_path: Path
+) -> None:
+    coder = [
+        call("replace_in_file", path="app/main.py", old="'hi'", new="'hey'"),
+        say("done"),
+        say("repair 1: no idea"),
+        say("repair 2: still no idea"),
+    ]
+    strong = [
+        *planner_script(),
+        call("replace_in_file", path="app/main.py", old="'hey'", new="'hello'"),
+        say("fixed by the strong model"),
+        APPROVE,
+    ]
+    state, _ = run(repo, tmp_path, strong, coder)
+
+    assert state["status"] == "approved"
+    assert [r["model_route"] for r in state["repairs"]] == [
+        "coder",
+        "coder",
+        "strong (escalated)",
+    ]
