@@ -44,7 +44,7 @@ class Settings(BaseSettings):
 
     # Jev via the TypeSafe API (console.typesafe.ai).
     typesafe_api_key: SecretStr | None = None
-    typesafe_base_url: str = "https://api.typesafe.ai/v1"
+    typesafe_base_url: str = "https://api.typesafe.ai"  # SDK appends /v1/systemone
     # Alias of the latest release. Pin a versioned id (e.g. "jev-1.13.0") once
     # confidence thresholds are tuned against it.
     jev_model: str = "jev-latest"

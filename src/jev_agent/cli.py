@@ -20,9 +20,9 @@ from jev_agent.config import ModelTier, Settings, get_settings
 from jev_agent.decisions import (
     BooleanQuestion,
     ChoiceQuestion,
-    HttpJevClient,
     JevError,
     ScoreQuestion,
+    TypeSafeJevClient,
 )
 from jev_agent.decisions.client import State
 from jev_agent.decisions.fabric import Decisions
@@ -60,7 +60,7 @@ def doctor() -> None:
         )
 
     try:
-        evaluation = HttpJevClient.from_settings(settings).evaluate(
+        evaluation = TypeSafeJevClient.from_settings(settings).evaluate(
             {
                 "ticket": "Login returns HTTP 500 when the password field is empty.",
                 "result": "Fix applied; all tests pass; diff touches only auth.py and a test.",
@@ -147,7 +147,7 @@ def run(
 def _decisions(settings: Settings, *, enabled: bool) -> Decisions:
     if not enabled or settings.typesafe_api_key is None:
         return Decisions(None)
-    return Decisions(HttpJevClient.from_settings(settings), settings.jev_min_confidence)
+    return Decisions(TypeSafeJevClient.from_settings(settings), settings.jev_min_confidence)
 
 
 def _approver(mode: Approvals) -> Approver:
@@ -250,7 +250,7 @@ def ask(
     except json.JSONDecodeError:
         parsed = state
     try:
-        evaluation = HttpJevClient.from_settings(get_settings()).evaluate(
+        evaluation = TypeSafeJevClient.from_settings(get_settings()).evaluate(
             parsed,
             {"q": BooleanQuestion(instructions=question)},
         )

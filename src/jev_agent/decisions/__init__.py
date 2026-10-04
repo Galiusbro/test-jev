@@ -1,4 +1,4 @@
-from jev_agent.decisions.client import FakeJevClient, HttpJevClient, JevClient, JevError
+from jev_agent.decisions.client import FakeJevClient, JevClient, JevError, TypeSafeJevClient
 from jev_agent.decisions.types import (
     BooleanAnswer,
     BooleanQuestion,
@@ -17,10 +17,10 @@ __all__ = [
     "ChoiceQuestion",
     "Evaluation",
     "FakeJevClient",
-    "HttpJevClient",
     "JevClient",
     "JevError",
     "Question",
     "ScoreAnswer",
     "ScoreQuestion",
+    "TypeSafeJevClient",
 ]

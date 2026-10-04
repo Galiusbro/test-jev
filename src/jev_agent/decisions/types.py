@@ -6,7 +6,7 @@ Jev answers three kinds of questions about a `state`:
 - choice: one option out of a named set
 - score: a level on an ordered scale (index 0..n-1, fractional score allowed)
 
-The TypeSafe request/response shapes live in `decisions.wire`.
+`decisions.client` maps these onto `langchain_typesafe`'s Noul / Choice / Score.
 """
 
 from __future__ import annotations

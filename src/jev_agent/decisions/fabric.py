@@ -79,7 +79,7 @@ class Decisions:
             return None, 0.0, "jev disabled"
         start = time.perf_counter()
         try:
-            evaluation = self.client.evaluate(state, questions)
+            evaluation = self.client.evaluate(state, questions, name=name)
         except JevError as exc:
             return None, time.perf_counter() - start, str(exc)
         return evaluation, time.perf_counter() - start, None

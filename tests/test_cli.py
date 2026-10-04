@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from jev_agent import cli
 from jev_agent.config import ModelTier, Settings
-from jev_agent.decisions import FakeJevClient, HttpJevClient, JevError, Question
+from jev_agent.decisions import FakeJevClient, JevError, Question, TypeSafeJevClient
 from jev_agent.decisions.client import State
 from jev_agent.llm import CallLog, CallRecord, LLMConfigError, LLMError
 
@@ -56,7 +56,7 @@ def _patch_jev(monkeypatch: pytest.MonkeyPatch, fake: FakeJevClient | Exception)
             raise fake
         return fake
 
-    monkeypatch.setattr(HttpJevClient, "from_settings", staticmethod(from_settings))
+    monkeypatch.setattr(TypeSafeJevClient, "from_settings", staticmethod(from_settings))
 
 
 def test_doctor_all_ok(monkeypatch: pytest.MonkeyPatch) -> None:

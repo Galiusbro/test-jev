@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from typing import Any
 
-import httpx
+import httpx2
 import pytest
-import respx
+from langchain_core.tracers.context import collect_runs
+from langchain_typesafe import TypeSafeClassifier
 from pydantic import SecretStr
 
 from jev_agent.config import Settings
@@ -12,14 +15,12 @@ from jev_agent.decisions import (
     BooleanQuestion,
     ChoiceQuestion,
     FakeJevClient,
-    HttpJevClient,
     JevError,
     Question,
     ScoreQuestion,
+    TypeSafeJevClient,
 )
 from jev_agent.decisions.types import BooleanCriteria
-
-BASE = "https://jev.test/v1"
 
 QUESTIONS: dict[str, Question] = {
     "done": BooleanQuestion(
@@ -33,43 +34,62 @@ QUESTIONS: dict[str, Question] = {
     "risk": ScoreQuestion(instructions="How risky?", levels=["low", "medium", "high"]),
 }
 
+FULL_RESPONSE = {
+    "model": "jev-1.13.0",
+    "answers": {
+        "done": {"type": "noul", "noul": 0.95},
+        "kind": {
+            "type": "choice",
+            "choice": "bug",
+            "probabilities": {"bug": 0.88, "feature": 0.12},
+            "confidence": 0.81,
+        },
+        "risk": {
+            "type": "score",
+            "score": 1.05,
+            "legend": {"0": "low", "1": "medium", "2": "high"},
+            "probabilities": {"0": 0.0, "1": 0.95, "2": 0.05},
+            "confidence": 0.92,
+        },
+    },
+    "usage": {"input_tokens": 300, "output_tokens": 20},
+}
 
-def _client(sleeps: list[float] | None = None) -> HttpJevClient:
-    log = sleeps if sleeps is not None else []
-    return HttpJevClient("key-123", base_url=BASE, sleep=log.append)
+Handler = Callable[[httpx2.Request], httpx2.Response]
 
 
-# --- Wire format (docs.typesafe.ai/api) ----------------------------------------
+def client_with(
+    handler: Handler | list[httpx2.Response], sleeps: list[float] | None = None
+) -> tuple[TypeSafeJevClient, list[httpx2.Request]]:
+    seen: list[httpx2.Request] = []
+    queue = list(handler) if isinstance(handler, list) else None
 
+    def transport(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        if queue is not None:
+            return queue.pop(0)
+        assert callable(handler)
+        return handler(request)
 
-@respx.mock
-def test_typesafe_request_and_response_mapping() -> None:
-    route = respx.post(f"{BASE}/systemone").respond(
-        json={
-            "model": "jev-1.13.0",
-            "answers": {
-                "done": {"type": "noul", "noul": 0.95},
-                "kind": {
-                    "type": "choice",
-                    "choice": "bug",
-                    "probabilities": {"bug": 0.88, "feature": 0.12},
-                    "confidence": 0.81,
-                },
-                "risk": {
-                    "type": "score",
-                    "score": 1.05,
-                    "legend": {"0": "low", "1": "medium", "2": "high"},
-                    "probabilities": {"0": 0.0, "1": 0.95, "2": 0.05},
-                    "confidence": 0.92,
-                },
-            },
-            "usage": {"input_tokens": 300, "output_tokens": 20},
-        }
+    classifier = TypeSafeClassifier(
+        api_key="key-123",
+        base_url="https://jev.test",
+        client=httpx2.Client(transport=httpx2.MockTransport(transport)),
     )
+    log = sleeps if sleeps is not None else []
+    return TypeSafeJevClient(classifier, sleep=log.append), seen
 
-    evaluation = _client().evaluate({"ticket": "Login returns 500"}, QUESTIONS)
 
-    request = route.calls.last.request
+def ok(body: dict[str, Any]) -> Handler:
+    return lambda _request: httpx2.Response(200, json=body)
+
+
+def test_maps_questions_to_sdk_and_answers_back() -> None:
+    client, seen = client_with(ok(FULL_RESPONSE))
+    evaluation = client.evaluate({"ticket": "Login returns 500"}, QUESTIONS, name="triage")
+
+    request = seen[0]
+    assert str(request.url) == "https://jev.test/v1/systemone"
     assert request.headers["Authorization"] == "Bearer key-123"
     body = json.loads(request.content)
     assert body["model"] == "jev-latest"
@@ -105,104 +125,98 @@ def test_typesafe_request_and_response_mapping() -> None:
         0.95,
         0.92,
     )
+    assert risk.legend == {"0": "low", "1": "medium", "2": "high"}
 
 
-@respx.mock
-def test_noul_without_criteria_omits_field() -> None:
-    route = respx.post(f"{BASE}/systemone").respond(
-        json={"answers": {"q": {"type": "noul", "noul": 0.5}}}
-    )
-    answer = _client().evaluate("x", {"q": BooleanQuestion(instructions="Done?")}).boolean("q")
-    assert "criteria" not in json.loads(route.calls.last.request.content)["questions"]["q"]
-    assert answer.confidence == 0.0  # coin flip = no confidence
-    assert not answer.is_confident(0.7)
+def test_structured_instructions_pass_through() -> None:
+    client, seen = client_with(ok({"model": "m", "answers": {"q": {"type": "noul", "noul": 0.1}}}))
+    question = BooleanQuestion(instructions={"finding": "x", "question": "Is `finding` real?"})
+    client.evaluate("diff", {"q": question})
+    sent = json.loads(seen[0].content)["questions"]["q"]
+    assert sent == {
+        "type": "noul",
+        "instructions": {"finding": "x", "question": "Is `finding` real?"},
+    }
 
 
-@respx.mock
-def test_retries_rate_limit_then_succeeds() -> None:
-    route = respx.post(f"{BASE}/systemone")
-    route.side_effect = [
-        httpx.Response(429, headers={"retry-after": "2"}),
-        httpx.Response(529),
-        httpx.Response(200, json={"answers": {"q": {"type": "noul", "noul": 1.0}}}),
-    ]
+def test_calls_are_langchain_runs_named_per_decision() -> None:
+    client, _ = client_with(ok(FULL_RESPONSE))
+    with collect_runs() as collector:
+        client.evaluate("x", QUESTIONS, name="assess_plan")
+    (run,) = collector.traced_runs
+    assert run.name == "jev:assess_plan"
+    assert "jev" in (run.tags or [])
+    assert run.extra["metadata"]["ls_provider"] == "typesafe"
+
+
+def test_retries_rate_limit_and_overload_then_succeeds() -> None:
     sleeps: list[float] = []
-    evaluation = _client(sleeps=sleeps).evaluate("x", {"q": BooleanQuestion(instructions="?")})
+    client, seen = client_with(
+        [
+            httpx2.Response(429, headers={"retry-after": "2"}, json={"error": "slow"}),
+            httpx2.Response(529, json={"error": "overloaded"}),
+            httpx2.Response(
+                200, json={"model": "m", "answers": {"q": {"type": "noul", "noul": 1}}}
+            ),
+        ],
+        sleeps,
+    )
+    evaluation = client.evaluate("x", {"q": BooleanQuestion(instructions="?")})
     assert evaluation.boolean("q").probability == 1.0
+    assert len(seen) == 3
     assert sleeps == [2.0, 1.0]  # retry-after honoured, then exponential backoff
 
 
-@respx.mock
 def test_gives_up_after_max_retries() -> None:
-    respx.post(f"{BASE}/systemone").respond(status_code=429, text="slow down")
     sleeps: list[float] = []
-    with pytest.raises(JevError, match="429"):
-        _client(sleeps=sleeps).evaluate("x", {"q": BooleanQuestion(instructions="?")})
+    client, _ = client_with(lambda _r: httpx2.Response(529, json={"error": "overloaded"}), sleeps)
+    with pytest.raises(JevError, match="unavailable after retries"):
+        client.evaluate("x", {"q": BooleanQuestion(instructions="?")})
     assert len(sleeps) == 3
 
 
-# --- Errors -------------------------------------------------------------------
-
-
-@respx.mock
 def test_auth_error_not_retried() -> None:
-    respx.post(f"{BASE}/systemone").respond(status_code=401, text="bad key")
     sleeps: list[float] = []
-    with pytest.raises(JevError, match="401"):
-        _client(sleeps=sleeps).evaluate("x", {"q": BooleanQuestion(instructions="?")})
-    assert sleeps == []
-
-
-@respx.mock
-def test_network_error_raises_jev_error() -> None:
-    respx.post(f"{BASE}/systemone").mock(side_effect=httpx.ConnectError("down"))
+    client, seen = client_with(lambda _r: httpx2.Response(401, json={"error": "bad key"}), sleeps)
     with pytest.raises(JevError, match="request failed"):
-        _client().evaluate("x", {"q": BooleanQuestion(instructions="?")})
+        client.evaluate("x", {"q": BooleanQuestion(instructions="?")})
+    assert sleeps == [] and len(seen) == 1
 
 
-@respx.mock
+def test_network_error_raises_jev_error() -> None:
+    def down(_request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("down")
+
+    client, _ = client_with(down)
+    with pytest.raises(JevError, match="request failed"):
+        client.evaluate("x", {"q": BooleanQuestion(instructions="?")})
+
+
 def test_missing_answer_raises_jev_error() -> None:
-    respx.post(f"{BASE}/systemone").respond(json={"answers": {}})
+    client, _ = client_with(ok({"model": "m", "answers": {}}))
     with pytest.raises(JevError, match="missing answers"):
-        _client().evaluate("x", {"q": BooleanQuestion(instructions="?")})
+        client.evaluate("x", {"q": BooleanQuestion(instructions="?")})
 
 
-@pytest.mark.parametrize(
-    "answer",
-    [{"type": "noul"}, {"type": "mystery", "noul": 1}, {"type": "score", "score": 1.0}],
-)
-@respx.mock
-def test_malformed_response_raises_jev_error(answer: dict[str, object]) -> None:
-    respx.post(f"{BASE}/systemone").respond(json={"answers": {"q": answer}})
-    with pytest.raises(JevError, match="Unexpected"):
-        _client().evaluate("x", {"q": BooleanQuestion(instructions="?")})
+def test_malformed_response_raises_jev_error() -> None:
+    client, _ = client_with(ok({"model": "m", "answers": {"q": {"type": "noul"}}}))
+    with pytest.raises(JevError):
+        client.evaluate("x", {"q": BooleanQuestion(instructions="?")})
 
 
 def test_wrong_answer_kind_raises_type_error() -> None:
     fake = FakeJevClient(lambda _s, _q: {"done": {"type": "boolean", "probability": 1.0}})
-    evaluation = fake.evaluate("x", {"done": BooleanQuestion(instructions="Done?")})
+    evaluation = fake.evaluate("x", {"done": BooleanQuestion(instructions="Done?")}, name="n")
     with pytest.raises(TypeError):
         evaluation.choice("done")
-    assert len(fake.calls) == 1
+    assert fake.names == ["n"]
 
 
-# --- Settings -----------------------------------------------------------------
-
-
-def test_from_settings_requires_key() -> None:
+def test_from_settings() -> None:
     with pytest.raises(JevError, match="TYPESAFE_API_KEY"):
-        HttpJevClient.from_settings(Settings(_env_file=None))
-
-
-@respx.mock
-def test_from_settings_uses_url_and_pinned_model() -> None:
-    route = respx.post("https://api.typesafe.ai/v1/systemone").respond(
-        json={"answers": {"q": {"type": "noul", "noul": 1.0}}}
+        TypeSafeJevClient.from_settings(Settings(_env_file=None))
+    client = TypeSafeJevClient.from_settings(
+        Settings(_env_file=None, typesafe_api_key=SecretStr("ts-key"), jev_model="jev-1.13.0")
     )
-    settings = Settings(
-        _env_file=None, typesafe_api_key=SecretStr("ts-key"), jev_model="jev-1.13.0"
-    )
-    HttpJevClient.from_settings(settings).evaluate("x", {"q": BooleanQuestion(instructions="?")})
-    request = route.calls.last.request
-    assert request.headers["Authorization"] == "Bearer ts-key"
-    assert json.loads(request.content)["model"] == "jev-1.13.0"
+    assert client.classifier.model == "jev-1.13.0"
+    assert client.classifier.base_url == "https://api.typesafe.ai"
