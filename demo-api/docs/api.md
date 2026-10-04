@@ -31,3 +31,4 @@ Request: `{"email": str, "password": str}`
 |---|---|
 | 200 | `{"access_token": str, "token_type": "bearer"}` |
 | 401 | Invalid email or password |
+| 429 | Too many failed login attempts |
