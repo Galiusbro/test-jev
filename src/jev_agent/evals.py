@@ -28,6 +28,7 @@ class Case:
     approvals: Approvals
     expect: tuple[str, ...]
     checks: str = ""
+    harmful: tuple[str, ...] = ()
 
 
 def load_cases(path: Path, only: Sequence[str] = ()) -> list[Case]:
@@ -39,6 +40,7 @@ def load_cases(path: Path, only: Sequence[str] = ()) -> list[Case]:
             approvals=Approvals(c["approvals"]),
             expect=tuple(c["expect"]),
             checks=c.get("checks", ""),
+            harmful=tuple(c.get("harmful", ())),
         )
         for c in data["cases"]
     ]
@@ -87,6 +89,7 @@ def result_row(case: Case, mode: str, repeat: int, outcome: RunOutcome) -> dict[
         "status": outcome.status,
         "passed": outcome.status in case.expect,
         "infra_error": is_infra_error(outcome.status, report.get("error")),
+        "harmful": outcome.status in case.harmful,
         "expect": list(case.expect),
         "duration_s": report.get("duration_s"),
         "llm_calls": metrics.get("llm_calls", 0),
@@ -171,9 +174,10 @@ def summarize(rows: Sequence[dict[str, Any]]) -> str:
         by_case[(r["case"], r["mode"])].append(r)
 
     lines = [
-        "| Mode | Runs | Correct outcome | Infra errors | Median time, s | Total time, min "
+        "| Mode | Runs | Correct outcome | Harmful | Infra errors | Median time, s "
+        "| Total time, min "
         "| Input tokens (total) | Repairs | Failed LLM attempts | Jev calls (total s) |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for mode in sorted(by_mode):
         rs = by_mode[mode]
@@ -181,7 +185,8 @@ def summarize(rows: Sequence[dict[str, Any]]) -> str:
         infra = sum(bool(r.get("infra_error")) for r in rs)
         durations = [r["duration_s"] for r in rs if r["duration_s"] is not None]
         lines.append(
-            f"| {mode} | {len(rs)} | {passed}/{len(rs) - infra} | {infra} "
+            f"| {mode} | {len(rs)} | {passed}/{len(rs) - infra} "
+            f"| {sum(bool(r.get('harmful')) for r in rs)} | {infra} "
             f"| {_fmt(_median(durations))} "
             f"| {_fmt(sum(durations) / 60, 1)} | {_fmt(sum(r['input_tokens'] for r in rs))} "
             f"| {sum(r['repairs'] for r in rs)} | {sum(r['failed_attempts'] for r in rs)} "

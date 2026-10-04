@@ -49,8 +49,8 @@ def test_summarize_tables() -> None:
         for m, s in [("jev", "approved"), ("no-jev", "validation_failed")]
     ]
     text = summarize(rows)
-    assert "| jev | 1 | 1/1 |" in text
-    assert "| no-jev | 1 | 0/1 |" in text
+    assert "| jev | 1 | 1/1 | 0 |" in text
+    assert "| no-jev | 1 | 0/1 | 0 |" in text
     assert "| a | no-jev | validation_failed | 0/1 |" in text
 
 
@@ -139,6 +139,17 @@ def test_infra_errors_are_separated_and_retryable(tmp_path: Path) -> None:
 
     rerun = result_row(case, "jev", 1, outcome("approved"))
     text = summarize([lost, real, rerun])  # the rerun replaces the lost run
-    assert "| jev | 1 | 1/1 | 0 |" in text
-    assert "| no-jev | 1 | 0/1 | 0 |" in text
-    assert "| jev | 1 | 0/0 | 1 |" in summarize([lost])
+    assert "| jev | 1 | 1/1 | 0 | 0 |" in text
+    assert "| no-jev | 1 | 0/1 | 0 | 0 |" in text
+    assert "| jev | 1 | 0/0 | 0 | 1 |" in summarize([lost])
+
+
+def test_harmful_outcomes_are_counted() -> None:
+    trap = Case("t", Path("t"), Approvals.NONE, ("needs_human",), harmful=("approved",))
+    bad = result_row(trap, "no-jev", 1, outcome("approved"))
+    safe = result_row(trap, "jev", 1, outcome("rejected"))
+    assert (bad["harmful"], safe["harmful"]) == (True, False)
+    assert safe["passed"] is False  # safe, but not the expected outcome
+    text = summarize([bad, safe])
+    assert "| no-jev | 1 | 0/1 | 1 |" in text
+    assert "| jev | 1 | 0/1 | 0 |" in text

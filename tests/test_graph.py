@@ -573,3 +573,34 @@ def test_review_survives_a_short_outage(repo: Path, tmp_path: Path) -> None:
     state, _ = run(repo, tmp_path, strong, [FIX, say("done")], sleep=pauses.append)
     assert state["status"] == "approved"
     assert pauses == [60.0]
+
+
+def test_plan_without_files_is_retried() -> None:
+    from jev_agent.agents import Plan, structured
+
+    empty = call("Plan", **(PLAN_ARGS | {"files_to_change": [], "files_to_create": []}))
+    model = ScriptedChatModel(replies=[empty, call("Plan", **PLAN_ARGS)])
+    plan = structured(model, Plan, [HumanMessage("plan it")])
+    assert plan.files_to_change == ["app/main.py"]
+    assert "must name at least one file" in str(model.seen[1][-2].content)
+
+
+def test_truncated_exploration_keeps_what_was_found(tmp_path: Path, repo: Path) -> None:
+    from jev_agent.agents import _findings
+
+    ws = Workspace.create(repo, tmp_path / "run")
+    model = ScriptedChatModel(
+        replies=[
+            AIMessage(
+                "hello() is in app/main.py",
+                tool_calls=[{"name": "read_file", "args": {"path": "app/main.py"}, "id": "r1"}],
+            ),
+            call("read_file", "r2", path="AGENTS.md"),
+        ]
+    )
+    explore = run_agent(model, make_tools(ws, writable=False), "system", "go", 2)
+    assert not explore.finished
+    notes = _findings(explore)
+    assert "Exploration stopped at the step limit" in notes
+    assert "Files inspected: AGENTS.md, app/main.py" in notes
+    assert "hello() is in app/main.py" in notes

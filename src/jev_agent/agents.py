@@ -14,7 +14,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from jev_agent.harness import LoopResult, run_agent
 from jev_agent.llm import LLMError
@@ -33,6 +33,16 @@ class Plan(BaseModel):
     risk: Literal["low", "medium", "high"]
     public_api_change: bool = Field(description="New/removed/renamed endpoints, fields, codes.")
     db_migration: bool = Field(description="Any database schema change.")
+
+    @model_validator(mode="after")
+    def _names_files(self) -> Plan:
+        # A plan without files is an investigation note, not a plan; the policy
+        # check would wave it through and the implementer would work blind.
+        if not self.files_to_change and not self.files_to_create:
+            raise ValueError(
+                "the plan must name at least one file in files_to_change or files_to_create"
+            )
+        return self
 
 
 _PLANNER_SYSTEM = """\
@@ -71,13 +81,35 @@ def plan_ticket(
         raise LLMError(explore.error)
     # Keep the findings, drop raw tool traffic: the structured call only needs
     # the ticket and the planner's conclusions.
-    findings = explore.messages[-1].text if explore.finished else ""
+    findings = _findings(explore)
     request = [
         SystemMessage(_PLANNER_SYSTEM.format(rules=instructions.text)),
         HumanMessage(f"Ticket:\n\n{ticket.as_text()}"),
         HumanMessage(f"Your investigation notes:\n\n{findings}\n\n{_PLAN_REQUEST}"),
     ]
     return structured(model, Plan, request), explore
+
+
+def _findings(explore: LoopResult) -> str:
+    """The planner's notes; if exploration hit the step limit, keep what it got."""
+    if explore.finished and explore.messages:
+        return explore.messages[-1].text
+    notes = [m.text for m in explore.messages if isinstance(m, AIMessage) and m.text.strip()]
+    read = sorted(
+        {
+            str(tc["args"].get("path", ""))
+            for m in explore.messages
+            if isinstance(m, AIMessage)
+            for tc in m.tool_calls
+            if tc["name"] == "read_file"
+        }
+    )
+    parts = ["(Exploration stopped at the step limit.)"]
+    if read:
+        parts.append("Files inspected: " + ", ".join(read))
+    if notes:
+        parts.append("Notes so far:\n" + "\n".join(notes))
+    return "\n".join(parts)
 
 
 class StructuredOutputError(RuntimeError):
