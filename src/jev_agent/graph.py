@@ -52,6 +52,7 @@ from jev_agent.harness import JevModelRouter, JevWriteGateMiddleware
 from jev_agent.llm import CallLog, LLMError
 from jev_agent.policy import Approver, Policy, deny_all, parse_rules
 from jev_agent.project import ProjectInstructions, load_instructions
+from jev_agent.proof import RegressionProof, prove_tests
 from jev_agent.tickets import Ticket
 from jev_agent.tools import make_tools
 from jev_agent.workspace import CommandResult, Workspace
@@ -105,6 +106,7 @@ class RunState(TypedDict, total=False):
     autofix: list[CommandResult]
     validation: list[CommandResult]
     checks_passed: bool
+    proof: RegressionProof
     review: Review | None  # None: the latest review failed — never route on a stale one
     repair_attempts: int
     repairs: list[dict[str, Any]]
@@ -254,6 +256,15 @@ def build_graph(cfg: RunConfig) -> Any:
             "changed_files": ws.changed_files(),
         }
 
+    def prove(state: RunState) -> RunState:
+        return {
+            "proof": prove_tests(
+                state["workspace"],
+                state.get("changed_files", []),
+                state["instructions"].commands.get("test"),
+            )
+        }
+
     def review(state: RunState) -> RunState:
         def attempt() -> Review:
             return review_change(
@@ -288,7 +299,11 @@ def build_graph(cfg: RunConfig) -> Any:
         return result.model_copy(update={"findings": findings})
 
     def repair(state: RunState) -> RunState:
-        if not state.get("checks_passed"):
+        proof = state.get("proof")
+        if state.get("checks_passed") and proof is not None and not proof.acceptable:
+            reason = "regression_proof"
+            problems = _proof_problem(proof)
+        elif not state.get("checks_passed"):
             reason = "checks"
             problems = _failed_checks(state.get("validation", []))
             if state.get("failure_kind") == "test":
@@ -354,8 +369,13 @@ def build_graph(cfg: RunConfig) -> Any:
         if not state.get("changed_files"):
             return "report"
         if state.get("checks_passed"):
-            return "review"
+            return "prove_tests"
         return "diagnose" if can_repair(state) else "report"
+
+    def after_prove(state: RunState) -> str:
+        if state["proof"].acceptable:
+            return "review"
+        return "repair" if can_repair(state) else "report"
 
     def after_review(state: RunState) -> str:
         result = state.get("review")
@@ -372,6 +392,7 @@ def build_graph(cfg: RunConfig) -> Any:
         ("implement", implement),
         ("validate", validate),
         ("diagnose", diagnose),
+        ("prove_tests", prove),
         ("review", review),
         ("repair", repair),
         ("report", report),
@@ -383,7 +404,8 @@ def build_graph(cfg: RunConfig) -> Any:
     graph.add_conditional_edges("plan", after_plan, ["policy_check", "report"])
     graph.add_conditional_edges("policy_check", after_policy, ["implement", "report"])
     graph.add_edge("implement", "validate")
-    graph.add_conditional_edges("validate", after_validate, ["review", "diagnose", "report"])
+    graph.add_conditional_edges("validate", after_validate, ["prove_tests", "diagnose", "report"])
+    graph.add_conditional_edges("prove_tests", after_prove, ["review", "repair", "report"])
     graph.add_conditional_edges("diagnose", after_diagnose, ["repair", "report"])
     graph.add_conditional_edges("review", after_review, ["repair", "report"])
     graph.add_edge("repair", "validate")
@@ -398,10 +420,36 @@ def final_status(state: RunState) -> Status:
         return "no_changes"
     if not state.get("checks_passed"):
         return "validation_failed"
+    proof = state.get("proof")
+    if proof is not None and not proof.acceptable:
+        return "validation_failed"  # definition of done: tests must fail without the change
     result = state.get("review")
     if result is None:
         return "error"  # review itself failed
     return "approved" if result.approved else "changes_requested"
+
+
+def _proof_problem(proof: RegressionProof) -> str:
+    detail = (
+        f"\n\nTest output on the original code:\n```\n{proof.result.output}\n```"
+        if proof.result
+        else ""
+    )
+    if proof.status == "no_tests":
+        return (
+            "The change modifies source code but adds no tests. Add regression tests that "
+            "fail without the change and pass with it."
+        )
+    return (
+        f"Regression proof failed: {proof.detail}. Tests: {', '.join(proof.tests)}. "
+        "Make the tests exercise the new behaviour so they fail on the original code." + detail
+    )
+
+
+def _proof_report(proof: RegressionProof | None) -> dict[str, Any] | None:
+    if proof is None:
+        return None
+    return {"status": proof.status, "tests": list(proof.tests), "detail": proof.detail}
 
 
 def _failed_checks(results: list[CommandResult]) -> str:
@@ -461,6 +509,7 @@ def write_report(cfg: RunConfig, state: RunState) -> dict[str, Any]:
         },
         "repairs": state.get("repairs", []),
         "validation": [asdict(r) for r in state.get("validation", [])],
+        "regression_proof": _proof_report(state.get("proof")),
         "review": review.model_dump() | {"approved": review.approved} if review else None,
         "policy": policy_report(state["policy"]) if "policy" in state else None,
         "jev": {

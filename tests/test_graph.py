@@ -38,7 +38,8 @@ def repo(tmp_path: Path) -> Path:
     (root / "app" / "main.py").write_text("def hello():\n    return 'hi'\n")
     (root / "AGENTS.md").write_text(
         "# Target\n\n## Commands\n\n"
-        "- test: `python -c \"from app.main import hello; assert hello() == 'hello'\"`\n"
+        # named `check`, not `test`: the regression proof needs a real test runner
+        "- check: `python -c \"from app.main import hello; assert hello() == 'hello'\"`\n"
     )
     return root
 

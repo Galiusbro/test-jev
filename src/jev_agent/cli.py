@@ -211,6 +211,10 @@ def _describe(node: str, state: dict[str, Any]) -> str:
             return f" [red]rejected[/]{jev}"
         plan_decision = [d for d in state["policy"].audit if d.action == "plan"][-1]
         return f": {plan_decision.verdict} — {plan_decision.reason}{jev}"
+    if node == "prove_tests":
+        proof = state["proof"]
+        mark = "[green]✓[/]" if proof.acceptable else "[red]✗[/]"
+        return f": {mark} {proof.status} — {proof.detail}"
     if node == "diagnose":
         return f": failure looks like a [bold]{state['failure_kind']}[/] problem"
     if node == "implement":
