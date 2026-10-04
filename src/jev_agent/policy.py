@@ -121,17 +121,12 @@ class Policy:
     approver: Approver = deny_all
     # Repo-relative path -> file content at the baseline commit (None if new).
     baseline: Callable[[str], str | None] = lambda _path: None
-    # Repo-relative path -> current content (None if missing); for the semantic gate.
-    current: Callable[[str], str | None] | None = None
     audit: list[Decision] = field(default_factory=list)
     approved_paths: set[str] = field(default_factory=set)
-    # Semantic check for writes that pass the deterministic rules (Jev in M5):
-    # (path, content before, content after) -> approval reason, or None.
-    semantic_gate: Callable[[str, str | None, str], str | None] | None = None
 
     @property
     def advisory(self) -> list[str]:
-        """Rules code cannot check — candidates for the semantic gate."""
+        """Rules code cannot check — screened semantically by the Jev write gate."""
         return [r.text for r in self.rules if not r.enforced and r.kind != "allowed"]
 
     def _of(self, kind: RuleKind) -> list[Rule]:
@@ -169,10 +164,6 @@ class Policy:
             reason = f"would remove existing tests: {', '.join(sorted(removed))}"
             self._log("write", path, "deny", reason)
             return f"ERROR: denied by policy — {reason}. Existing tests must be kept."
-        if self.semantic_gate and (
-            flag := self.semantic_gate(path, self._current(path), new_content)
-        ):
-            return self._ask("write", path, flag)
         if path in self.approved_paths:
             self._log("write", path, "allow", "previously approved")
             return None
@@ -186,12 +177,15 @@ class Policy:
             return None
         return self._ask("write", path, "outside the allowed scope")
 
-    def _current(self, path: str) -> str | None:
-        return self.current(path) if self.current else self.baseline(path)
+    def request_write_approval(self, path: str, reason: str) -> str | None:
+        """Ask the human about one specific edit (not remembered for the path)."""
+        return self._ask("write", path, reason, remember=False)
 
-    def _ask(self, action: Literal["write"], path: str, reason: str) -> str | None:
+    def _ask(
+        self, action: Literal["write"], path: str, reason: str, *, remember: bool = True
+    ) -> str | None:
         if self.approver(ApprovalRequest(action, (path,), (reason,))):
-            if not reason.startswith("Jev"):  # semantic flags are per edit, not per path
+            if remember:
                 self.approved_paths.add(path)
             self._log(action, path, "approved", reason)
             return None

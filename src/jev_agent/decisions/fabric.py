@@ -17,9 +17,8 @@ import difflib
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from jev_agent.agents import Finding, Plan
 from jev_agent.decisions.client import JevClient, JevError, State
 from jev_agent.decisions.types import (
     BooleanCriteria,
@@ -30,6 +29,9 @@ from jev_agent.decisions.types import (
     ScoreQuestion,
 )
 from jev_agent.tickets import Ticket
+
+if TYPE_CHECKING:  # agents -> harness -> fabric: keep runtime imports acyclic
+    from jev_agent.agents import Finding, Plan
 
 TicketKind = Literal["bug", "feature", "docs", "refactor", "out_of_scope"]
 FailureKind = Literal["code", "test", "environment"]
@@ -213,8 +215,8 @@ class Decisions:
 
     def write_gate(
         self,
-        ticket: Ticket,
-        plan: Plan,
+        ticket_title: str,
+        plan_summary: str,
         advisory_rules: Sequence[str],
         path: str,
         before: str | None,
@@ -236,8 +238,8 @@ class Decisions:
         evaluation, latency, error = self._ask(
             "write_gate",
             {
-                "ticket": ticket.title,
-                "plan_summary": plan.summary,
+                "ticket": ticket_title,
+                "plan_summary": plan_summary,
                 "rules": list(advisory_rules),
                 "edit": _clip(edit),
             },
@@ -274,6 +276,32 @@ class Decisions:
             error=None,
         )
         return reason
+
+    # 4b — model routing (used by the harness's JevModelRouter) ---------------
+
+    def route_model(
+        self, task: str, routes: Mapping[str, str], instructions: str, default: str
+    ) -> str:
+        """Pick the model route for an agent run. Fallback: `default`."""
+        evaluation, latency, error = self._ask(
+            "route_model",
+            {"task": _clip(task)},
+            {"route": ChoiceQuestion(instructions=instructions, options=dict(routes))},
+        )
+        if evaluation is None:
+            self._record("route_model", None, default, fallback=True, latency=latency, error=error)
+            return default
+        route = evaluation.choice("route")
+        chosen = route.value if self._sure(route) and route.value in routes else default
+        self._record(
+            "route_model",
+            evaluation,
+            chosen,
+            fallback=chosen != route.value,
+            latency=latency,
+            error=None,
+        )
+        return chosen
 
     # 5 — failure diagnosis ----------------------------------------------------
 

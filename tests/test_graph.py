@@ -9,9 +9,9 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from scripted_model import ScriptedChatModel, call, say
 
-from jev_agent.agents import run_tool_loop
 from jev_agent.config import ModelTier
 from jev_agent.graph import RunConfig, build_graph
+from jev_agent.harness import run_agent
 from jev_agent.llm import CallLog, CallRecord
 from jev_agent.tickets import Ticket
 from jev_agent.tools import make_tools
@@ -126,7 +126,9 @@ def test_failed_checks_are_repaired_with_real_output(repo: Path, tmp_path: Path)
 
     assert state["status"] == "approved"
     assert state["repair_attempts"] == 1
-    assert state["repairs"] == [{"reason": "checks", "steps": 2, "finished": True}]
+    assert state["repairs"] == [
+        {"reason": "checks", "steps": 2, "finished": True, "model_route": "coder"}
+    ]
     repair_prompt = str(models["coder"].seen[2][1].content)
     assert "Automated checks failed" in repair_prompt and "AssertionError" in repair_prompt
     assert "-    return 'hi'" in repair_prompt  # current diff included
@@ -195,7 +197,9 @@ def test_autofix_runs_before_checks(repo: Path, tmp_path: Path) -> None:
     assert state["repair_attempts"] == 0
 
 
-def test_loop_reports_unknown_tool_and_bad_arguments(tmp_path: Path, repo: Path) -> None:
+def test_run_agent_handles_unknown_tools_bad_arguments_and_limits(
+    tmp_path: Path, repo: Path
+) -> None:
     ws = Workspace.create(repo, tmp_path / "run")
     bad_args = AIMessage(
         "",
@@ -210,12 +214,27 @@ def test_loop_reports_unknown_tool_and_bad_arguments(tmp_path: Path, repo: Path)
         ],
     )
     model = ScriptedChatModel(replies=[call("rm_rf", path="/"), bad_args, say("ok")])
-    result = run_tool_loop(model, make_tools(ws, writable=False), [HumanMessage("go")], 5)
+    result = run_agent(model, make_tools(ws, writable=False), "system", "go", 5)
 
     assert result.finished and result.steps == 3
     tool_messages = [m for m in result.messages if isinstance(m, ToolMessage)]
-    assert "unknown tool 'rm_rf'" in str(tool_messages[0].content)
+    assert "rm_rf is not a valid tool" in str(tool_messages[0].content)
     assert "could not parse arguments: bad json" in str(tool_messages[1].content)
+
+    looping = ScriptedChatModel(replies=[call("list_files", f"l{i}") for i in range(3)])
+    limited = run_agent(looping, make_tools(ws, writable=False), "system", "go", 2)
+    assert (limited.steps, limited.finished) == (2, False)
+    assert limited.tool_calls == ["list_files", "list_files"]
+
+
+def test_run_agent_reports_model_failure_with_progress(tmp_path: Path, repo: Path) -> None:
+    from jev_agent.llm import LLMError
+
+    ws = Workspace.create(repo, tmp_path / "run")
+    model = ScriptedChatModel(replies=[call("list_files"), LLMError("all models failed")])
+    result = run_agent(model, make_tools(ws, writable=False), "system", "go", 5)
+    assert result.error == "all models failed"
+    assert (result.steps, result.finished, result.tool_calls) == (1, False, ["list_files"])
 
 
 def test_structured_retries_after_text_reply() -> None:
@@ -270,7 +289,7 @@ def test_llm_failure_mid_implementation_is_incomplete(repo: Path, tmp_path: Path
 
 
 def test_compact_keeps_latest_read_per_file_and_elides_the_rest() -> None:
-    from jev_agent.agents import KEEP_RECENT_TOOL_OUTPUTS, compact
+    from jev_agent.harness import KEEP_RECENT_TOOL_OUTPUTS, compact
 
     history: list[Any] = [HumanMessage("go")]
 
@@ -400,6 +419,7 @@ def jev_ok(**overrides: Any) -> Any:
         "complexity": s(1.0),
         "violates": b(0.05),
         "cause": c("code"),
+        "route": c("coder"),
     }
     table.update(overrides)
 
@@ -455,23 +475,30 @@ def test_test_diagnosis_guides_repair(repo: Path, tmp_path: Path) -> None:
     )
 
 
-def test_high_complexity_uses_strong_model_for_code(repo: Path, tmp_path: Path) -> None:
+def test_jev_router_sends_code_to_the_strong_model(repo: Path, tmp_path: Path) -> None:
     decisions = jev_ok(
-        complexity={
-            "type": "score",
-            "value": "x",
-            "score": 1.9,
-            "probability": 0.9,
-            "confidence": 0.9,
-        }
+        route={"type": "choice", "value": "strong", "probability": 0.9, "confidence": 0.9}
     )
     strong = [*planner_script(), FIX, say("done by the strong model"), APPROVE]
     state, models = run(repo, tmp_path, strong, [], decisions=decisions)
 
     assert state["status"] == "approved"
-    assert state["assessment"].complexity == "high"
+    assert state["model_route"] == "strong"
     assert models["coder"].seen == []
     assert any("write_file" in tools for tools in models["strong"].bound_tools)
+    assert any(d.name == "route_model" and d.outcome == "strong" for d in decisions.log)
+
+
+def test_unsure_router_falls_back_to_coder(repo: Path, tmp_path: Path) -> None:
+    decisions = jev_ok(
+        route={"type": "choice", "value": "strong", "probability": 0.5, "confidence": 0.2}
+    )
+    state, models = run(
+        repo, tmp_path, [*planner_script(), APPROVE], [FIX, say("done")], decisions=decisions
+    )
+    assert state["status"] == "approved"
+    assert state["model_route"] == "coder"
+    assert models["coder"].seen != []
 
 
 def test_high_risk_plan_needs_approval_even_inside_scope(repo: Path, tmp_path: Path) -> None:

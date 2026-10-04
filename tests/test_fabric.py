@@ -61,7 +61,8 @@ def test_disabled_fabric_returns_pre_jev_fallbacks() -> None:
     assert not d.enabled
     assert d.triage(TICKET, "rules").stop_reason is None
     assert d.assess_plan(TICKET, PLAN).complexity == "medium"
-    assert d.write_gate(TICKET, PLAN, [], "a.py", "x", "y") is None
+    assert d.write_gate(TICKET.title, PLAN.summary, [], "a.py", "x", "y") is None
+    assert d.route_model("task", {"coder": "c", "strong": "s"}, "which?", "coder") == "coder"
     assert d.diagnose(TICKET, "failed", "diff") == "code"
     finding = Finding(severity="major", file="a.py", issue="i")
     assert d.verify_findings(TICKET, "diff", [finding]) == [True]
@@ -118,7 +119,12 @@ def test_assess_plan(
 def test_write_gate_flags_confident_violations_only() -> None:
     d, client = jev(violates=yes(0.97))
     reason = d.write_gate(
-        TICKET, PLAN, ["Disabling lint"], "pyproject.toml", "[lint]\n", "[lint]\nignore=['ALL']\n"
+        TICKET.title,
+        PLAN.summary,
+        ["Disabling lint"],
+        "pyproject.toml",
+        "[lint]\n",
+        "[lint]\nignore=['ALL']\n",
     )
     assert reason is not None and "Jev" in reason
     state = client.calls[0][0]
@@ -127,9 +133,9 @@ def test_write_gate_flags_confident_violations_only() -> None:
     assert "+ignore=['ALL']" in state["edit"]
 
     d, _ = jev(violates=yes(0.7))  # leaning yes, below the bar
-    assert d.write_gate(TICKET, PLAN, [], "a.py", None, "x = 1\n") is None
+    assert d.write_gate(TICKET.title, PLAN.summary, [], "a.py", None, "x = 1\n") is None
     d, _ = jev(violates=yes(0.8))  # measured: adding @pytest.mark.skip
-    assert d.write_gate(TICKET, PLAN, [], "tests/test_a.py", "a", "b") is not None
+    assert d.write_gate(TICKET.title, PLAN.summary, [], "tests/test_a.py", "a", "b") is not None
 
 
 @pytest.mark.parametrize(
@@ -159,3 +165,18 @@ def test_verify_findings_uses_structured_instructions() -> None:
     assert question.instructions["finding"] == "a.py: Resets the counter."
     assert d.verify_findings(TICKET, "diff", []) == []
     assert d.log[-1].outcome == "supported 2/3"
+
+
+@pytest.mark.parametrize(
+    ("route", "expected"),
+    [
+        (choice("strong"), "strong"),
+        (choice("strong", confidence=0.3), "coder"),  # unsure → default
+        (choice("bogus"), "coder"),  # unknown route → default
+    ],
+)
+def test_route_model(route: dict[str, Any], expected: str) -> None:
+    d, client = jev(route=route)
+    routes = {"coder": "Routine change", "strong": "Hard change"}
+    assert d.route_model("Implement X", routes, "Which model?", "coder") == expected
+    assert client.names == ["route_model"]

@@ -29,6 +29,7 @@ from typing import Any, Literal, TypedDict
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langchain_typesafe.experimental.middleware import ModelChoice
 from langgraph.graph import END, START, StateGraph
 
 from jev_agent.agents import (
@@ -47,12 +48,13 @@ from jev_agent.decisions.fabric import (
     PlanAssessment,
     Triage,
 )
+from jev_agent.harness import JevModelRouter, JevWriteGateMiddleware
 from jev_agent.llm import CallLog, LLMError
 from jev_agent.policy import Approver, Policy, deny_all, parse_rules
 from jev_agent.project import ProjectInstructions, load_instructions
 from jev_agent.tickets import Ticket
 from jev_agent.tools import make_tools
-from jev_agent.workspace import CommandResult, Workspace, WorkspaceError
+from jev_agent.workspace import CommandResult, Workspace
 
 Status = Literal[
     "approved",
@@ -91,6 +93,7 @@ class RunState(TypedDict, total=False):
     plan: Plan
     assessment: PlanAssessment
     failure_kind: FailureKind
+    model_route: str
     implement_finished: bool
     implement_steps: int
     tool_calls: list[str]
@@ -165,18 +168,40 @@ def build_graph(cfg: RunConfig) -> Any:
                 "status": "rejected",
                 "error": "plan rejected: " + "; ".join(verdict.reasons),
             }
-        if cfg.decisions.enabled:
-            ws = state["workspace"]
-            policy.current = lambda path: _read(ws, path)
-            policy.semantic_gate = lambda path, before, after: cfg.decisions.write_gate(
-                ticket, plan, policy.advisory, path, before, after
-            )
         return {"assessment": assessment}
 
-    def coder_tier(state: RunState) -> ModelTier:
-        # Jev-rated high complexity gets the strong chain for writing code too.
-        hard = state.get("assessment") and state["assessment"].complexity == "high"
-        return ModelTier.STRONG if hard else ModelTier.CODER
+    def coder_middleware(state: RunState) -> list[Any]:  # AgentMiddleware of mixed states
+        """Jev middleware for agents that write code; none without Jev."""
+        if not cfg.decisions.enabled:
+            return []
+        return [
+            JevModelRouter(
+                choices={
+                    "coder": ModelChoice(
+                        model=model(ModelTier.CODER),
+                        criteria="Routine, well-specified change in a few files",
+                    ),
+                    "strong": ModelChoice(
+                        model=model(ModelTier.STRONG),
+                        criteria="Subtle logic, cross-cutting change, or repeated failures",
+                    ),
+                },
+                instructions="Which model should carry out this coding task? "
+                "Prefer the cheaper `coder` unless the task needs the strong model.",
+                decisions=cfg.decisions,
+                default="coder",
+            ),
+            JevWriteGateMiddleware(
+                decisions=cfg.decisions,
+                policy=state["policy"],
+                workspace=state["workspace"],
+                ticket_title=state["ticket"].title,
+                plan_summary=state["plan"].summary,
+            ),
+        ]
+
+    def hard(state: RunState) -> bool:
+        return bool(state.get("assessment") and state["assessment"].complexity == "high")
 
     def diagnose(state: RunState) -> RunState:
         kind = cfg.decisions.diagnose(
@@ -194,16 +219,17 @@ def build_graph(cfg: RunConfig) -> Any:
 
     def implement(state: RunState) -> RunState:
         tools = writer_tools(state)
-        hard = coder_tier(state) is ModelTier.STRONG
         loop = implement_plan(
-            model(coder_tier(state)),
+            model(ModelTier.CODER),
             tools,
             state["ticket"],
             state["plan"],
             state["instructions"],
-            cfg.implement_max_steps + (10 if hard else 0),
+            cfg.implement_max_steps + (10 if hard(state) else 0),
+            coder_middleware(state),
         )
         update: RunState = {
+            "model_route": loop.route or "coder",
             "implement_finished": loop.finished,
             "implement_steps": loop.steps,
             "tool_calls": loop.tool_calls,
@@ -270,7 +296,7 @@ def build_graph(cfg: RunConfig) -> Any:
             assert current is not None, "after_review only routes here with a review"
             problems = _blocking_findings(current)
         loop = repair_change(
-            model(coder_tier(state)),
+            model(ModelTier.CODER),
             writer_tools(state),
             state["ticket"],
             state["plan"],
@@ -278,8 +304,14 @@ def build_graph(cfg: RunConfig) -> Any:
             problems,
             state["workspace"].diff(),
             cfg.repair_max_steps,
+            coder_middleware(state),
         )
-        record = {"reason": reason, "steps": loop.steps, "finished": loop.finished}
+        record: dict[str, Any] = {
+            "reason": reason,
+            "steps": loop.steps,
+            "finished": loop.finished,
+            "model_route": loop.route or "coder",
+        }
         if loop.error:
             record["error"] = loop.error
         return {
@@ -359,13 +391,6 @@ def final_status(state: RunState) -> Status:
     if result is None:
         return "error"  # review itself failed
     return "approved" if result.approved else "changes_requested"
-
-
-def _read(ws: Workspace, path: str) -> str | None:
-    try:
-        return ws.resolve(path).read_text()
-    except (OSError, UnicodeDecodeError, WorkspaceError):
-        return None
 
 
 def _failed_checks(results: list[CommandResult]) -> str:

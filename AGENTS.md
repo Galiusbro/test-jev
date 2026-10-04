@@ -14,7 +14,11 @@ src/jev_agent/
   config.py       # Settings from env/.env; ModelTier -> model id
   llm/            # ResilientChatModel: streaming, fallback chain, call log
                   #   reasoning.py maps on/off/low to each model family's flags
-  decisions/      # Jev: typed questions/answers, HTTP client, fake client
+  decisions/      # Jev via langchain-typesafe's TypeSafeClassifier; fabric.py =
+                  #   the decisions on graph edges (thresholds + fallbacks)
+  harness.py      # agents = LangChain create_agent + middleware (step limit,
+                  #   compaction, Jev model router, Jev write gate)
+  graph.py        # LangGraph workflow; policy.py = AGENTS.md rules in code
   cli.py          # `jev-agent` Typer app
 demo-api/         # separate uv project — the repo the agent works ON
 tests/            # unit tests; no network

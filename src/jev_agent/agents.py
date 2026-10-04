@@ -1,21 +1,22 @@
 """Planner, implementer, repairer and reviewer agents.
 
-Tool-using agents share one bounded loop: the model calls tools until it
-answers without tool calls or the step budget runs out. No unbounded autonomy.
-Old tool output is elided from the prompt so long loops stay affordable.
+Tool-using agents run on the LangChain `create_agent` harness (`harness.py`):
+bounded steps, context compaction and Jev middleware. The planner's final plan
+and the review are structured outputs with a corrective retry.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 from typing import Literal
 
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
+from jev_agent.harness import LoopResult, run_agent
 from jev_agent.llm import LLMError
 from jev_agent.project import ProjectInstructions
 from jev_agent.tickets import Ticket
@@ -32,101 +33,6 @@ class Plan(BaseModel):
     risk: Literal["low", "medium", "high"]
     public_api_change: bool = Field(description="New/removed/renamed endpoints, fields, codes.")
     db_migration: bool = Field(description="Any database schema change.")
-
-
-@dataclass
-class LoopResult:
-    messages: list[BaseMessage]
-    steps: int
-    finished: bool  # False = step budget exhausted or the model failed
-    tool_calls: list[str] = field(default_factory=list)
-    error: str | None = None  # every model in the chain failed mid-loop
-
-
-KEEP_RECENT_TOOL_OUTPUTS = 6
-ELIDE_ABOVE_CHARS = 400
-
-
-def compact(history: Sequence[BaseMessage]) -> list[BaseMessage]:
-    """Shrink old tool output while keeping what the agent is working with.
-
-    - The latest `read_file` of every path is kept: elided file contents made
-      agents re-read the file they were editing in a loop.
-    - Earlier reads of the same path are stale and are elided.
-    - Other tool outputs older than the last few are elided when long.
-
-    Tool-call / tool-result pairing stays intact, so providers accept it.
-    """
-    read_paths = _read_paths(history)
-    latest_read = {path: i for i, path in read_paths.items()}
-    keep = set(latest_read.values())
-    other = [i for i, m in enumerate(history) if isinstance(m, ToolMessage) and i not in read_paths]
-    keep |= set(other[-KEEP_RECENT_TOOL_OUTPUTS:])
-    out: list[BaseMessage] = []
-    for i, message in enumerate(history):
-        if isinstance(message, ToolMessage) and i not in keep:
-            text = str(message.content)
-            if len(text) > ELIDE_ABOVE_CHARS or i in read_paths:
-                note = "superseded by a later read" if i in read_paths else "elided"
-                message = ToolMessage(
-                    f"[{message.name or 'tool'} output {note} ({len(text)} chars)]",
-                    tool_call_id=message.tool_call_id,
-                    name=message.name,
-                )
-        out.append(message)
-    return out
-
-
-def _read_paths(history: Sequence[BaseMessage]) -> dict[int, str]:
-    """Index of each read_file result -> the path it read."""
-    paths: dict[str, str] = {}  # tool_call_id -> path
-    for message in history:
-        if isinstance(message, AIMessage):
-            for tc in message.tool_calls:
-                if tc["name"] == "read_file":
-                    paths[tc["id"] or ""] = str(tc["args"].get("path", ""))
-    return {
-        i: paths[m.tool_call_id]
-        for i, m in enumerate(history)
-        if isinstance(m, ToolMessage) and m.tool_call_id in paths
-    }
-
-
-def run_tool_loop(
-    model: BaseChatModel,
-    tools: Sequence[BaseTool],
-    messages: list[BaseMessage],
-    max_steps: int,
-) -> LoopResult:
-    by_name = {t.name: t for t in tools}
-    bound = model.bind_tools(list(tools))
-    history = list(messages)
-    called: list[str] = []
-    for step in range(1, max_steps + 1):
-        try:
-            reply = bound.invoke(compact(history))
-        except LLMError as exc:
-            return LoopResult(history, step - 1, False, called, error=str(exc))
-        assert isinstance(reply, AIMessage)
-        history.append(reply)
-        if not reply.tool_calls and not reply.invalid_tool_calls:
-            return LoopResult(history, step, True, called)
-        for call in reply.tool_calls:
-            tool = by_name.get(call["name"])
-            if tool is None:
-                output = f"ERROR: unknown tool {call['name']!r}; available: {sorted(by_name)}"
-            else:
-                output = str(tool.invoke(call["args"]))
-            called.append(call["name"])
-            history.append(ToolMessage(output, tool_call_id=call["id"] or "", name=call["name"]))
-        for bad in reply.invalid_tool_calls:
-            history.append(
-                ToolMessage(
-                    f"ERROR: could not parse arguments: {bad.get('error')}. Send valid JSON.",
-                    tool_call_id=bad.get("id") or "",
-                )
-            )
-    return LoopResult(history, max_steps, False, called)
 
 
 _PLANNER_SYSTEM = """\
@@ -154,13 +60,11 @@ def plan_ticket(
     instructions: ProjectInstructions,
     max_steps: int = 12,
 ) -> tuple[Plan, LoopResult]:
-    explore = run_tool_loop(
+    explore = run_agent(
         model,
         tools,
-        [
-            SystemMessage(_PLANNER_SYSTEM.format(rules=instructions.text)),
-            HumanMessage(f"Ticket:\n\n{ticket.as_text()}"),
-        ],
+        _PLANNER_SYSTEM.format(rules=instructions.text),
+        f"Ticket:\n\n{ticket.as_text()}",
         max_steps,
     )
     if explore.error:
@@ -233,18 +137,15 @@ def implement_plan(
     plan: Plan,
     instructions: ProjectInstructions,
     max_steps: int = 30,
+    middleware: Sequence[AgentMiddleware] = (),
 ) -> LoopResult:
-    return run_tool_loop(
+    return run_agent(
         model,
         tools,
-        [
-            SystemMessage(_IMPLEMENTER_SYSTEM.format(rules=instructions.text)),
-            HumanMessage(
-                f"Ticket:\n\n{ticket.as_text()}\n\n"
-                f"Approved plan:\n\n{plan.model_dump_json(indent=2)}"
-            ),
-        ],
+        _IMPLEMENTER_SYSTEM.format(rules=instructions.text),
+        f"Ticket:\n\n{ticket.as_text()}\n\nApproved plan:\n\n{plan.model_dump_json(indent=2)}",
         max_steps,
+        middleware,
     )
 
 
@@ -276,19 +177,17 @@ def repair_change(
     problems: str,
     diff: str,
     max_steps: int = 15,
+    middleware: Sequence[AgentMiddleware] = (),
 ) -> LoopResult:
-    return run_tool_loop(
+    return run_agent(
         model,
         tools,
-        [
-            SystemMessage(_REPAIR_SYSTEM.format(rules=instructions.text)),
-            HumanMessage(
-                f"Ticket:\n\n{ticket.as_text()}\n\nPlan summary: {plan.summary}\n\n"
-                f"Current diff:\n\n```diff\n{_clip(diff, 12_000)}\n```\n\n"
-                f"Problems to fix:\n\n{problems}"
-            ),
-        ],
+        _REPAIR_SYSTEM.format(rules=instructions.text),
+        f"Ticket:\n\n{ticket.as_text()}\n\nPlan summary: {plan.summary}\n\n"
+        f"Current diff:\n\n```diff\n{_clip(diff, 12_000)}\n```\n\n"
+        f"Problems to fix:\n\n{problems}",
         max_steps,
+        middleware,
     )
 
 
