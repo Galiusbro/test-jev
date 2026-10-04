@@ -24,7 +24,32 @@ uv run jev-agent doctor
 | `jev-agent run tickets/001-….md [--repo demo-api] [--approvals ask\|all\|none] [--no-jev] [--open-pr]` | Ticket → plan → implement → validate on a copy; writes `runs/<id>/report.json` + `changes.diff` |
 | `jev-agent eval [--case ID] [--mode jev\|no-jev] [--repeats N]` | Run the eval cases; results to `evals/results/latest.jsonl` (resumable) |
 | `jev-agent eval-report [results.jsonl]` | Summary tables (Markdown) |
+| `jev-agent mcp [--repo DIR] [--approvals none\|all]` | Serve the repo's governed tools over MCP (stdio) |
 | `jev-agent ask "Question?" -s '<state>'` | One yes/no Jev decision — for tuning question wording |
+
+## Use from any MCP client
+
+`jev-agent mcp` serves a repository's governed tools over MCP, so your own
+coding agent works under the same rules as jev-agent's agents: AGENTS.md
+policy on every read and write, `.env` hidden, existing tests protected,
+`run_check` limited to the declared commands, plus Jev-backed `triage_ticket`.
+
+Claude Code (`.mcp.json` in the project you work on):
+
+```json
+{
+  "mcpServers": {
+    "jev-agent": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/Jev-agent",
+               "jev-agent", "mcp", "--repo", "/path/to/target-repo"]
+    }
+  }
+}
+```
+
+`--approvals none` (default) refuses approval-required writes; `--approvals all`
+allows them.
 
 ## Development
 
