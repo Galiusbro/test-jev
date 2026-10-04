@@ -26,6 +26,10 @@ docs/api.md    # public API reference — update when behaviour changes
 - Type hints everywhere; `mypy --strict` must pass.
 - Every behaviour change ships with a test that fails without the change.
 - Keep diffs minimal: no drive-by refactors or renames outside the task.
+- Never trust client-supplied headers (e.g. `X-Forwarded-For`) for security
+  decisions. Behind a reverse proxy the ASGI server resolves the client
+  address (`uvicorn --proxy-headers --forwarded-allow-ips=<proxy>`); app code
+  uses `request.client.host`.
 
 ## Commands
 

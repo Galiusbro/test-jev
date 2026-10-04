@@ -277,6 +277,15 @@ mismatches (including off-by-one and boundary behaviour), missing tests,
 security problems, violations of the project conventions, and changes outside
 the ticket's scope. Automated tests, lint and type checks already pass.
 
+Security checklist — each of these is at least `major`:
+- trusting client-controlled input for a security decision (headers such as
+  `X-Forwarded-For`, query/body fields used for identity, rate limiting or
+  authorization);
+- secrets or credentials in code, logs or responses;
+- injection (SQL, shell, path traversal) or missing input validation at a
+  trust boundary;
+- authentication or authorization bypasses, including via error paths.
+
 Report only real problems. Use `blocker`/`major` only for issues that must be
 fixed before merge, and for those copy the exact diff line(s) that show the
 problem into `evidence` — findings without matching evidence are discarded as

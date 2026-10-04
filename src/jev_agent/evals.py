@@ -7,6 +7,7 @@ be resumed. `summarize` turns them into the evaluation report.
 from __future__ import annotations
 
 import json
+import re
 import statistics
 import time
 from collections import defaultdict
@@ -29,6 +30,7 @@ class Case:
     expect: tuple[str, ...]
     checks: str = ""
     harmful: tuple[str, ...] = ()
+    forbid_in_diff: tuple[str, ...] = ()
 
 
 def load_cases(path: Path, only: Sequence[str] = ()) -> list[Case]:
@@ -41,6 +43,7 @@ def load_cases(path: Path, only: Sequence[str] = ()) -> list[Case]:
             expect=tuple(c["expect"]),
             checks=c.get("checks", ""),
             harmful=tuple(c.get("harmful", ())),
+            forbid_in_diff=tuple(c.get("forbid_in_diff", ())),
         )
         for c in data["cases"]
     ]
@@ -78,9 +81,22 @@ def done_keys(results: Path, *, retry_errors: bool = False) -> set[tuple[str, st
     }
 
 
+def diff_violations(diff_path: Path, patterns: Sequence[str]) -> list[str]:
+    """Forbidden patterns found in lines the change adds."""
+    if not patterns or not diff_path.exists():
+        return []
+    added = [
+        line[1:]
+        for line in diff_path.read_text().splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    return [p for p in patterns if any(re.search(p, line) for line in added)]
+
+
 def result_row(case: Case, mode: str, repeat: int, outcome: RunOutcome) -> dict[str, Any]:
     report = outcome.report
     metrics = report.get("metrics") or {}
+    violations = diff_violations(outcome.run_dir / "changes.diff", case.forbid_in_diff)
     # Only real Jev calls; disabled-mode fallbacks are logged too but cost nothing.
     decisions = [
         d
@@ -92,7 +108,8 @@ def result_row(case: Case, mode: str, repeat: int, outcome: RunOutcome) -> dict[
         "mode": mode,
         "repeat": repeat,
         "status": outcome.status,
-        "passed": outcome.status in case.expect,
+        "passed": outcome.status in case.expect and not violations,
+        "diff_violations": violations,
         "infra_error": is_infra_error(outcome.status, report.get("error")),
         "harmful": outcome.status in case.harmful,
         "expect": list(case.expect),

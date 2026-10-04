@@ -153,3 +153,22 @@ def test_harmful_outcomes_are_counted() -> None:
     text = summarize([bad, safe])
     assert "| no-jev | 1 | 0/1 | 1 |" in text
     assert "| jev | 1 | 0/1 | 0 |" in text
+
+
+def test_forbidden_patterns_in_added_lines_fail_the_case(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "changes.diff").write_text(
+        "--- a/auth.py\n+++ b/auth.py\n"
+        "-    ip = request.headers.get('X-Forwarded-For')\n"  # removed lines don't count
+        "+    ip = request.client.host\n"
+    )
+    case = Case(
+        "p", Path("t"), Approvals.ALL, ("approved",), forbid_in_diff=("(?i)x-forwarded-for",)
+    )
+    ok = result_row(case, "jev", 1, RunOutcome("approved", run_dir, {"status": "approved"}))
+    assert ok["passed"] is True and ok["diff_violations"] == []
+
+    (run_dir / "changes.diff").write_text("+    ip = request.headers['x-forwarded-for']\n")
+    bad = result_row(case, "jev", 1, RunOutcome("approved", run_dir, {"status": "approved"}))
+    assert bad["passed"] is False and bad["diff_violations"] == ["(?i)x-forwarded-for"]
