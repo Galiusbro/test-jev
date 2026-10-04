@@ -24,6 +24,7 @@ uv run jev-agent doctor
 | `jev-agent run tickets/001-….md [--repo demo-api] [--approvals ask\|all\|none] [--no-jev] [--open-pr]` | Ticket → plan → implement → validate on a copy; writes `runs/<id>/report.json` + `changes.diff` |
 | `jev-agent eval [--case ID] [--mode jev\|no-jev] [--repeats N]` | Run the eval cases; results to `evals/results/latest.jsonl` (resumable) |
 | `jev-agent eval-report [results.jsonl]` | Summary tables (Markdown) |
+| `jev-agent init DIR` | Bootstrap a repo: AGENTS.md (detected commands + policy), CLAUDE.md, .mcp.json; never overwrites |
 | `jev-agent mcp [--repo DIR] [--approvals none\|all]` | Serve the repo's governed tools over MCP (stdio) |
 | `jev-agent ask "Question?" -s '<state>'` | One yes/no Jev decision — for tuning question wording |
 
@@ -68,4 +69,4 @@ Agent instructions: [AGENTS.md](AGENTS.md).
 - [x] M4 — bounded repair, autofix, review agent, regression proof, GitHub PR (`--open-pr`)
 - [x] M5 — Jev decision fabric: triage, plan risk/complexity → approval + model choice, semantic write gate, failure diagnosis, review verification
 - [x] M6 — LangSmith tracing, eval harness, Jev vs no-Jev comparison → [evaluation report](docs/evaluation-report.md)
-- [ ] M7 — `jev-agent init`, MCP server, demo script
+- [x] M7 — `jev-agent init`, MCP server (demo script still to do)

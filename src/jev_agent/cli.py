@@ -34,6 +34,7 @@ from jev_agent.runner import (
     make_approver,
     make_decisions,
 )
+from jev_agent.scaffold import init_repo
 
 app = typer.Typer(help="Controlled ticket-to-PR agent.", no_args_is_help=True)
 console = Console()
@@ -171,6 +172,26 @@ def run(
         _add_to_report(outcome.run_dir, {"pull_request": url})
         console.print(f"[green]pull request:[/] {url}")
     raise typer.Exit(0 if outcome.status == "approved" else 1)
+
+
+@app.command()
+def init(
+    repo: Annotated[Path, typer.Argument(exists=True, file_okay=False, help="Repo to set up")],
+) -> None:
+    """Bootstrap REPO with AGENTS.md, CLAUDE.md and .mcp.json (never overwrites)."""
+    result = init_repo(repo, Path(__file__).resolve().parents[2])
+    stack = result.stack
+    console.print(f"[bold]{repo}[/]: detected [cyan]{stack.name}[/]")
+    for name, cmd in stack.commands.items():
+        console.print(f"  {name}: [dim]{cmd}[/]")
+    for name in result.written:
+        console.print(f"  [green]created[/] {name}")
+    for name in result.skipped:
+        console.print(f"  [yellow]kept existing[/] {name}")
+    console.print(
+        "Next: fill in the TODOs in AGENTS.md, review the rules, then try "
+        f"`jev-agent run <ticket.md> --repo {repo}`."
+    )
 
 
 @app.command()
