@@ -24,9 +24,16 @@ from jev_agent.decisions import (
 from jev_agent.decisions.client import State
 from jev_agent.evals import MODES, load_cases, read_results, run_series, summarize
 from jev_agent.llm import CallLog, LLMConfigError, LLMError, chat_model, list_models
+from jev_agent.mcp_server import build_server
 from jev_agent.observability import configure_tracing
 from jev_agent.pr import PullRequestError, open_pull_request
-from jev_agent.runner import Approvals, RunOutcome, execute_run, make_approver
+from jev_agent.runner import (
+    Approvals,
+    RunOutcome,
+    execute_run,
+    make_approver,
+    make_decisions,
+)
 
 app = typer.Typer(help="Controlled ticket-to-PR agent.", no_args_is_help=True)
 console = Console()
@@ -164,6 +171,24 @@ def run(
         _add_to_report(outcome.run_dir, {"pull_request": url})
         console.print(f"[green]pull request:[/] {url}")
     raise typer.Exit(0 if outcome.status == "approved" else 1)
+
+
+@app.command()
+def mcp(
+    repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("demo-api"),
+    approvals: Annotated[
+        Approvals, typer.Option(help="none: refuse approval-required writes; all: allow them")
+    ] = Approvals.NONE,
+    jev: Annotated[bool, typer.Option(help="Enable the Jev triage_ticket tool")] = True,
+) -> None:
+    """Serve REPO's governed tools over MCP (stdio) for any MCP client."""
+    if approvals is Approvals.ASK:
+        console.print("[red]--approvals ask needs a terminal; use none or all for MCP[/]")
+        raise typer.Exit(2)
+    server = build_server(
+        repo, approvals=approvals, decisions=make_decisions(get_settings(), enabled=jev)
+    )
+    server.run("stdio")
 
 
 @app.command("eval")

@@ -272,7 +272,10 @@ def test_structured_output_forces_tool_choice() -> None:
     )
     result = make(["a"]).with_structured_output(ReadFile).invoke("which file?")
     assert result == ReadFile(path="x.py")
-    assert bodies(route)[0]["tool_choice"] == "required"
+    assert bodies(route)[0]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "ReadFile"},
+    }
 
 
 @respx.mock
@@ -515,3 +518,14 @@ def test_leaked_channel_tokens_stripped_from_tool_name() -> None:
     message = make(["a"]).bind_tools([ReadFile]).invoke("x")
     assert isinstance(message, AIMessage)
     assert message.tool_calls[0]["name"] == "ReadFile"
+
+
+class ListFiles(BaseModel):
+    """List files."""
+
+
+@respx.mock
+def test_required_with_several_tools_stays_generic() -> None:
+    route = respx.post(URL).mock(side_effect=by_model({"a": ok(delta("a", content="x"))}))
+    make(["a"]).bind_tools([ReadFile, ListFiles], tool_choice="any").invoke("x")
+    assert bodies(route)[0]["tool_choice"] == "required"

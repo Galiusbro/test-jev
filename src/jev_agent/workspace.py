@@ -40,8 +40,11 @@ class CommandResult:
 
 
 class Workspace:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, base_ref: str = "base") -> None:
         self.root = root.resolve()
+        # Baseline for diffs and test protection: the run's "base" commit for a
+        # workspace copy, or e.g. HEAD when serving a live checkout over MCP.
+        self.base_ref = base_ref
 
     @classmethod
     def create(cls, source: Path, run_dir: Path) -> Workspace:
@@ -75,7 +78,8 @@ class Workspace:
     def baseline(self, relative: str) -> str | None:
         """Content of a file at the baseline commit, None if it did not exist."""
         try:
-            return self._git("show", f"base:{relative}")
+            # "./" makes the path relative to cwd, so a checkout subdir works too.
+            return self._git("show", f"{self.base_ref}:./{relative}")
         except WorkspaceError:
             return None
 

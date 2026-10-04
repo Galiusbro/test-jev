@@ -8,6 +8,7 @@ dependencies = [
     "langchain-core>=1.6.6",
     "langchain-typesafe[experimental]==0.0.1a3",
     "langgraph>=1.2.12",
+    "mcp>=2.3,<3",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "rich>=15.0.0",

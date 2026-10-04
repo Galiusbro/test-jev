@@ -275,7 +275,12 @@ class ResilientChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, AIMessage]:
         formatted = [convert_to_openai_tool(t) for t in tools]
-        if tool_choice in ("any", "required"):
+        if tool_choice in ("any", "required") and len(formatted) == 1:
+            # Structured output: name the function. Open models answer a generic
+            # "required" by calling tools they remember from earlier steps.
+            name = formatted[0]["function"]["name"]
+            kwargs["tool_choice"] = {"type": "function", "function": {"name": name}}
+        elif tool_choice in ("any", "required"):
             kwargs["tool_choice"] = "required"
         elif tool_choice and tool_choice not in ("auto", "none"):
             kwargs["tool_choice"] = {"type": "function", "function": {"name": tool_choice}}

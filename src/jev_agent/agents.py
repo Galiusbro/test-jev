@@ -139,7 +139,8 @@ def structured[T: BaseModel](
         history.append(
             HumanMessage(
                 f"Your previous reply was not a valid `{schema.__name__}` call ({problem}). "
-                f"Call the `{schema.__name__}` tool now with arguments matching its schema."
+                f"No other tools are available in this step. Call the `{schema.__name__}` "
+                "tool now with arguments matching its schema."
             )
         )
     raise StructuredOutputError(f"model did not return a valid {schema.__name__}: {problem}")
