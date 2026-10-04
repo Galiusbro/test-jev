@@ -14,7 +14,7 @@ from __future__ import annotations
 import ast
 import fnmatch
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -121,8 +121,18 @@ class Policy:
     approver: Approver = deny_all
     # Repo-relative path -> file content at the baseline commit (None if new).
     baseline: Callable[[str], str | None] = lambda _path: None
+    # Repo-relative path -> current content (None if missing); for the semantic gate.
+    current: Callable[[str], str | None] | None = None
     audit: list[Decision] = field(default_factory=list)
     approved_paths: set[str] = field(default_factory=set)
+    # Semantic check for writes that pass the deterministic rules (Jev in M5):
+    # (path, content before, content after) -> approval reason, or None.
+    semantic_gate: Callable[[str, str | None, str], str | None] | None = None
+
+    @property
+    def advisory(self) -> list[str]:
+        """Rules code cannot check — candidates for the semantic gate."""
+        return [r.text for r in self.rules if not r.enforced and r.kind != "allowed"]
 
     def _of(self, kind: RuleKind) -> list[Rule]:
         return [r for r in self.rules if r.kind == kind]
@@ -159,6 +169,10 @@ class Policy:
             reason = f"would remove existing tests: {', '.join(sorted(removed))}"
             self._log("write", path, "deny", reason)
             return f"ERROR: denied by policy — {reason}. Existing tests must be kept."
+        if self.semantic_gate and (
+            flag := self.semantic_gate(path, self._current(path), new_content)
+        ):
+            return self._ask("write", path, flag)
         if path in self.approved_paths:
             self._log("write", path, "allow", "previously approved")
             return None
@@ -172,9 +186,13 @@ class Policy:
             return None
         return self._ask("write", path, "outside the allowed scope")
 
+    def _current(self, path: str) -> str | None:
+        return self.current(path) if self.current else self.baseline(path)
+
     def _ask(self, action: Literal["write"], path: str, reason: str) -> str | None:
         if self.approver(ApprovalRequest(action, (path,), (reason,))):
-            self.approved_paths.add(path)
+            if not reason.startswith("Jev"):  # semantic flags are per edit, not per path
+                self.approved_paths.add(path)
             self._log(action, path, "approved", reason)
             return None
         self._log(action, path, "rejected", reason)
@@ -191,7 +209,7 @@ class Policy:
 
     # --- plan ----------------------------------------------------------------
 
-    def check_plan(self, plan: Plan) -> PlanVerdict:
+    def check_plan(self, plan: Plan, extra_reasons: Sequence[str] = ()) -> PlanVerdict:
         files = [*plan.files_to_change, *plan.files_to_create]
         forbidden = [
             f"{path}: {rule.text}"
@@ -217,6 +235,7 @@ class Policy:
             if flag and rule:
                 reasons.append(f"plan declares {trigger.replace('_', ' ')}: {rule.text}")
 
+        reasons.extend(extra_reasons)
         if not reasons:
             self._log("plan", "plan", "allow", "within allowed scope")
             return PlanVerdict(True, [])

@@ -16,7 +16,7 @@ from rich.table import Table
 
 from jev_agent.agents import StructuredOutputError
 from jev_agent.bench import CANDIDATES, run_bench
-from jev_agent.config import ModelTier, get_settings
+from jev_agent.config import ModelTier, Settings, get_settings
 from jev_agent.decisions import (
     BooleanQuestion,
     ChoiceQuestion,
@@ -25,6 +25,7 @@ from jev_agent.decisions import (
     ScoreQuestion,
 )
 from jev_agent.decisions.client import State
+from jev_agent.decisions.fabric import Decisions
 from jev_agent.graph import RunConfig, build_graph
 from jev_agent.llm import CallLog, LLMConfigError, LLMError, chat_model, list_models
 from jev_agent.policy import ApprovalRequest, Approver
@@ -104,6 +105,7 @@ def run(
     approvals: Annotated[
         Approvals, typer.Option(help="ask: prompt (deny without a terminal); all; none")
     ] = Approvals.ASK,
+    jev: Annotated[bool, typer.Option(help="Use Jev decisions (off = pre-Jev baseline)")] = True,
 ) -> None:
     """Run the ticket-to-diff workflow on a copy of REPO."""
     settings = get_settings()
@@ -115,8 +117,12 @@ def run(
         run_dir=run_dir,
         models=lambda tier, log: chat_model(tier, settings, call_log=log),
         approver=_approver(approvals),
+        decisions=_decisions(settings, enabled=jev),
     )
-    console.print(f"[bold]{ticket.title}[/] → {run_dir}")
+    console.print(
+        f"[bold]{ticket.title}[/] → {run_dir} "
+        f"[dim](jev {'on' if cfg.decisions.enabled else 'off'})[/]"
+    )
     state: dict[str, Any] = {"ticket": ticket, "started_at": time.time()}
     try:
         for update in build_graph(cfg).stream(state, stream_mode="updates"):
@@ -136,6 +142,12 @@ def run(
         console.print(f"  [red]{error}[/]")
     console.print(f"[{color}]{status}[/] · report: {run_dir / 'report.json'}")
     raise typer.Exit(0 if status == "approved" else 1)
+
+
+def _decisions(settings: Settings, *, enabled: bool) -> Decisions:
+    if not enabled or settings.typesafe_api_key is None:
+        return Decisions(None)
+    return Decisions(HttpJevClient.from_settings(settings), settings.jev_min_confidence)
 
 
 def _approver(mode: Approvals) -> Approver:
@@ -161,11 +173,19 @@ def _describe(node: str, state: dict[str, Any]) -> str:
             return " [red]failed[/]"
         plan = state["plan"]
         return f": {plan.summary} [dim](risk={plan.risk}, files={plan.files_to_change})[/]"
+    if node == "triage":
+        t = state["triage"]
+        stop = f" [yellow]→ human: {t.stop_reason}[/]" if t.stop_reason else ""
+        return f": {t.kind}, actionable={t.actionable}{stop}"
     if node == "policy_check":
+        a = state.get("assessment")
+        jev = f" [dim](complexity={a.complexity})[/]" if a else ""
         if state.get("status") == "rejected":
-            return " [red]rejected[/]"
+            return f" [red]rejected[/]{jev}"
         plan_decision = [d for d in state["policy"].audit if d.action == "plan"][-1]
-        return f": {plan_decision.verdict} — {plan_decision.reason}"
+        return f": {plan_decision.verdict} — {plan_decision.reason}{jev}"
+    if node == "diagnose":
+        return f": failure looks like a [bold]{state['failure_kind']}[/] problem"
     if node == "implement":
         done = "" if state["implement_finished"] else " [yellow]did not finish[/]"
         return f": {state['implement_steps']} steps, changed {state['changed_files']}{done}"

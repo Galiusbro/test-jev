@@ -11,9 +11,13 @@ The TypeSafe request/response shapes live in `decisions.wire`.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
+
+# A string, or an object holding the question plus data it refers to by name
+# (docs.typesafe.ai: "Use structure in the questions").
+Instructions = str | dict[str, Any]
 
 
 class BooleanCriteria(BaseModel):
@@ -23,21 +27,21 @@ class BooleanCriteria(BaseModel):
 
 class BooleanQuestion(BaseModel):
     type: Literal["boolean"] = "boolean"
-    instructions: str
+    instructions: Instructions
     # Optional descriptions of what yes / no mean.
     criteria: BooleanCriteria | None = None
 
 
 class ChoiceQuestion(BaseModel):
     type: Literal["choice"] = "choice"
-    instructions: str
+    instructions: Instructions
     # option key -> description; the key is what comes back in the answer.
     options: dict[str, str] = Field(min_length=2, max_length=255)
 
 
 class ScoreQuestion(BaseModel):
     type: Literal["score"] = "score"
-    instructions: str
+    instructions: Instructions
     # Ordered from lowest (index 0) to highest.
     levels: list[str] = Field(min_length=2, max_length=10)
 

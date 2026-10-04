@@ -368,3 +368,142 @@ def test_failed_review_never_routes_on_a_stale_verdict(repo: Path, tmp_path: Pat
     assert state["status"] == "error"
     assert state["review"] is None
     assert state["repair_attempts"] == 1  # no extra repair driven by the old review
+
+
+# --- M5: Jev decisions on the graph's edges -----------------------------------
+
+
+def jev_ok(**overrides: Any) -> Any:
+    """Decisions backed by a fake Jev that approves everything unless overridden."""
+    from jev_agent.decisions import FakeJevClient
+    from jev_agent.decisions.fabric import Decisions
+
+    def b(p: float) -> dict[str, Any]:
+        return {"type": "boolean", "probability": p}
+
+    def c(value: str) -> dict[str, Any]:
+        return {"type": "choice", "value": value, "probability": 0.9, "confidence": 0.9}
+
+    def s(value: float) -> dict[str, Any]:
+        return {
+            "type": "score",
+            "value": "x",
+            "score": value,
+            "probability": 0.9,
+            "confidence": 0.9,
+        }
+
+    table: dict[str, Any] = {
+        "kind": c("feature"),
+        "actionable": b(0.95),
+        "risk": s(0.5),
+        "complexity": s(1.0),
+        "violates": b(0.05),
+        "cause": c("code"),
+    }
+    table.update(overrides)
+
+    def respond(_state: Any, questions: Any) -> Any:
+        return {
+            name: table.get(name, b(0.95) if name.startswith("finding_") else None)
+            for name in questions
+        }
+
+    return Decisions(FakeJevClient(respond))
+
+
+def test_triage_sends_out_of_scope_ticket_to_a_human(repo: Path, tmp_path: Path) -> None:
+    decisions = jev_ok(
+        kind={"type": "choice", "value": "out_of_scope", "probability": 0.9, "confidence": 0.95}
+    )
+    state, models = run(repo, tmp_path, [], [], decisions=decisions)
+
+    assert state["status"] == "needs_human"
+    assert "out of scope" in state["error"]
+    assert models["strong"].seen == []  # no planning tokens spent
+    report = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert report["jev"]["enabled"] is True
+    assert report["jev"]["decisions"][0]["name"] == "triage"
+
+
+def test_environmental_failure_stops_instead_of_repairing(repo: Path, tmp_path: Path) -> None:
+    decisions = jev_ok(
+        cause={"type": "choice", "value": "environment", "probability": 0.9, "confidence": 0.9}
+    )
+    coder = [call("replace_in_file", path="app/main.py", old="'hi'", new="'hey'"), say("done")]
+    state, _ = run(repo, tmp_path, planner_script(), coder, decisions=decisions)
+
+    assert state["status"] == "needs_human"
+    assert state["failure_kind"] == "environment"
+    assert state["repair_attempts"] == 0
+
+
+def test_test_diagnosis_guides_repair(repo: Path, tmp_path: Path) -> None:
+    decisions = jev_ok(
+        cause={"type": "choice", "value": "test", "probability": 0.9, "confidence": 0.9}
+    )
+    coder = [
+        call("replace_in_file", path="app/main.py", old="'hi'", new="'hey'"),
+        say("done"),
+        call("replace_in_file", path="app/main.py", old="'hey'", new="'hello'"),
+        say("fixed"),
+    ]
+    state, models = run(repo, tmp_path, [*planner_script(), APPROVE], coder, decisions=decisions)
+    assert state["status"] == "approved"
+    assert "tests added for this ticket most likely contradict it" in str(
+        models["coder"].seen[2][1].content
+    )
+
+
+def test_high_complexity_uses_strong_model_for_code(repo: Path, tmp_path: Path) -> None:
+    decisions = jev_ok(
+        complexity={
+            "type": "score",
+            "value": "x",
+            "score": 1.9,
+            "probability": 0.9,
+            "confidence": 0.9,
+        }
+    )
+    strong = [*planner_script(), FIX, say("done by the strong model"), APPROVE]
+    state, models = run(repo, tmp_path, strong, [], decisions=decisions)
+
+    assert state["status"] == "approved"
+    assert state["assessment"].complexity == "high"
+    assert models["coder"].seen == []
+    assert any("write_file" in tools for tools in models["strong"].bound_tools)
+
+
+def test_high_risk_plan_needs_approval_even_inside_scope(repo: Path, tmp_path: Path) -> None:
+    decisions = jev_ok(
+        risk={"type": "score", "value": "High", "score": 1.9, "probability": 0.9, "confidence": 0.9}
+    )
+    state, _ = run(repo, tmp_path, planner_script(), [], decisions=decisions)
+    assert state["status"] == "rejected"  # default approver denies
+    assert "Jev rates the plan high-risk" in state["error"]
+
+
+def test_semantic_write_gate_blocks_flagged_edit(repo: Path, tmp_path: Path) -> None:
+    decisions = jev_ok(violates={"type": "boolean", "probability": 0.98})
+    coder = [FIX, say("done")]
+    state, models = run(repo, tmp_path, planner_script(), coder, decisions=decisions)
+
+    assert state["status"] == "no_changes"  # the only edit was refused
+    refused = next(m for m in models["coder"].seen[1] if isinstance(m, ToolMessage))
+    assert "Jev flags this edit" in str(refused.content)
+    assert any(d.verdict == "rejected" and "Jev" in d.reason for d in state["policy"].audit)
+
+
+def test_jev_disputed_finding_does_not_trigger_repair(repo: Path, tmp_path: Path) -> None:
+    decisions = jev_ok(finding_0={"type": "boolean", "probability": 0.02})
+    grounded_but_wrong = call("Review", summary="Hmm.", findings=[finding("major")])
+    state, _ = run(
+        repo,
+        tmp_path,
+        [*planner_script(), grounded_but_wrong],
+        [FIX, say("done")],
+        decisions=decisions,
+    )
+    assert state["status"] == "approved"
+    assert state["repair_attempts"] == 0
+    assert state["review"].findings[0].issue.startswith("[disputed by Jev]")

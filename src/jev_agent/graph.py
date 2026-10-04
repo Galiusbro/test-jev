@@ -9,7 +9,13 @@
 or blocking review findings send the change to `repair` while attempts remain.
 `policy_check` applies the target's AGENTS.md rules to the plan (forbidden
 files reject the run; approval-required changes ask the human), and the same
-policy guards every tool call. Jev decision edges plug in later.
+policy guards every tool call.
+
+Jev decisions (see `decisions.fabric`) sit on the edges: `triage` can send a
+ticket to a human before any tokens are spent, plan risk/complexity feed the
+approval check and the model choice, a semantic gate screens every write,
+`diagnose` stops runs whose failures are environmental, and review findings
+are verified. Without Jev each decision falls back to the pre-Jev behaviour.
 """
 
 from __future__ import annotations
@@ -35,15 +41,27 @@ from jev_agent.agents import (
     review_change,
 )
 from jev_agent.config import ModelTier
+from jev_agent.decisions.fabric import (
+    Decisions,
+    FailureKind,
+    PlanAssessment,
+    Triage,
+)
 from jev_agent.llm import CallLog, LLMError
 from jev_agent.policy import Approver, Policy, deny_all, parse_rules
 from jev_agent.project import ProjectInstructions, load_instructions
 from jev_agent.tickets import Ticket
 from jev_agent.tools import make_tools
-from jev_agent.workspace import CommandResult, Workspace
+from jev_agent.workspace import CommandResult, Workspace, WorkspaceError
 
 Status = Literal[
-    "approved", "changes_requested", "validation_failed", "no_changes", "rejected", "error"
+    "approved",
+    "changes_requested",
+    "validation_failed",
+    "no_changes",
+    "rejected",
+    "needs_human",
+    "error",
 ]
 ModelFactory = Callable[[ModelTier, CallLog], BaseChatModel]
 
@@ -60,6 +78,7 @@ class RunConfig:
     max_repair_attempts: int = 3
     setup_command: str | None = "uv sync --quiet"
     approver: Approver = deny_all
+    decisions: Decisions = field(default_factory=lambda: Decisions(None))
 
 
 class RunState(TypedDict, total=False):
@@ -68,7 +87,10 @@ class RunState(TypedDict, total=False):
     instructions: ProjectInstructions
     policy: Policy
     setup: CommandResult
+    triage: Triage
     plan: Plan
+    assessment: PlanAssessment
+    failure_kind: FailureKind
     implement_finished: bool
     implement_steps: int
     tool_calls: list[str]
@@ -126,21 +148,60 @@ def build_graph(cfg: RunConfig) -> Any:
             return {"status": "error", "error": f"planning failed: {exc}"}
         return {"plan": result}
 
+    def triage(state: RunState) -> RunState:
+        result = cfg.decisions.triage(state["ticket"], state["instructions"].text)
+        update: RunState = {"triage": result}
+        if result.stop_reason:
+            update |= {"status": "needs_human", "error": result.stop_reason}
+        return update
+
     def policy_check(state: RunState) -> RunState:
-        verdict = state["policy"].check_plan(state["plan"])
-        if verdict.approved:
-            return {}
-        return {"status": "rejected", "error": "plan rejected: " + "; ".join(verdict.reasons)}
+        ticket, plan, policy = state["ticket"], state["plan"], state["policy"]
+        assessment = cfg.decisions.assess_plan(ticket, plan)
+        verdict = policy.check_plan(plan, [assessment.escalate] if assessment.escalate else [])
+        if not verdict.approved:
+            return {
+                "assessment": assessment,
+                "status": "rejected",
+                "error": "plan rejected: " + "; ".join(verdict.reasons),
+            }
+        if cfg.decisions.enabled:
+            ws = state["workspace"]
+            policy.current = lambda path: _read(ws, path)
+            policy.semantic_gate = lambda path, before, after: cfg.decisions.write_gate(
+                ticket, plan, policy.advisory, path, before, after
+            )
+        return {"assessment": assessment}
+
+    def coder_tier(state: RunState) -> ModelTier:
+        # Jev-rated high complexity gets the strong chain for writing code too.
+        hard = state.get("assessment") and state["assessment"].complexity == "high"
+        return ModelTier.STRONG if hard else ModelTier.CODER
+
+    def diagnose(state: RunState) -> RunState:
+        kind = cfg.decisions.diagnose(
+            state["ticket"],
+            _failed_checks(state.get("validation", [])),
+            state["workspace"].diff(),
+        )
+        update: RunState = {"failure_kind": kind}
+        if kind == "environment":
+            update |= {
+                "status": "needs_human",
+                "error": "checks fail for environmental reasons; repairing the code won't help",
+            }
+        return update
 
     def implement(state: RunState) -> RunState:
         tools = writer_tools(state)
+        hard = coder_tier(state) is ModelTier.STRONG
         loop = implement_plan(
-            model(ModelTier.CODER),
+            model(coder_tier(state)),
             tools,
             state["ticket"],
             state["plan"],
             state["instructions"],
-            cfg.implement_max_steps,
+            cfg.implement_max_steps + (10 if hard else 0),
         )
         update: RunState = {
             "implement_finished": loop.finished,
@@ -173,19 +234,43 @@ def build_graph(cfg: RunConfig) -> Any:
             )
         except (LLMError, StructuredOutputError) as exc:
             return {"review": None, "error": f"review failed: {exc}"}
-        return {"review": result}
+        return {"review": _verify(result, state)}
+
+    def _verify(result: Review, state: RunState) -> Review:
+        blocking = result.blocking
+        verdicts = cfg.decisions.verify_findings(
+            state["ticket"], state["workspace"].diff(), blocking
+        )
+        disputed = {id(f) for f, ok in zip(blocking, verdicts, strict=True) if not ok}
+        findings = [
+            f.model_copy(update={"severity": "minor", "issue": f"[disputed by Jev] {f.issue}"})
+            if id(f) in disputed
+            else f
+            for f in result.findings
+        ]
+        return result.model_copy(update={"findings": findings})
 
     def repair(state: RunState) -> RunState:
         if not state.get("checks_passed"):
             reason = "checks"
             problems = _failed_checks(state.get("validation", []))
+            if state.get("failure_kind") == "test":
+                problems = (
+                    "Diagnosis: the tests added for this ticket most likely contradict it; "
+                    "fix those tests (never pre-existing ones).\n\n" + problems
+                )
+            elif state.get("failure_kind") == "code":
+                problems = (
+                    "Diagnosis: the application code is most likely wrong; the tests "
+                    "describe the ticket correctly.\n\n" + problems
+                )
         else:
             reason = "review"
             current = state.get("review")
             assert current is not None, "after_review only routes here with a review"
             problems = _blocking_findings(current)
         loop = repair_change(
-            model(ModelTier.CODER),
+            model(coder_tier(state)),
             writer_tools(state),
             state["ticket"],
             state["plan"],
@@ -207,6 +292,12 @@ def build_graph(cfg: RunConfig) -> Any:
         write_report(cfg, {**state, "status": status})
         return {"status": status}
 
+    def after_triage(state: RunState) -> str:
+        return "report" if state.get("status") == "needs_human" else "plan"
+
+    def after_diagnose(state: RunState) -> str:
+        return "report" if state.get("status") == "needs_human" else "repair"
+
     def after_plan(state: RunState) -> str:
         return "report" if state.get("status") == "error" else "policy_check"
 
@@ -221,7 +312,7 @@ def build_graph(cfg: RunConfig) -> Any:
             return "report"
         if state.get("checks_passed"):
             return "review"
-        return "repair" if can_repair(state) else "report"
+        return "diagnose" if can_repair(state) else "report"
 
     def after_review(state: RunState) -> str:
         result = state.get("review")
@@ -232,21 +323,25 @@ def build_graph(cfg: RunConfig) -> Any:
     graph = StateGraph(RunState)
     for name, node in [
         ("prepare_workspace", prepare_workspace),
+        ("triage", triage),
         ("plan", plan),
         ("policy_check", policy_check),
         ("implement", implement),
         ("validate", validate),
+        ("diagnose", diagnose),
         ("review", review),
         ("repair", repair),
         ("report", report),
     ]:
         graph.add_node(name, node)
     graph.add_edge(START, "prepare_workspace")
-    graph.add_edge("prepare_workspace", "plan")
+    graph.add_edge("prepare_workspace", "triage")
+    graph.add_conditional_edges("triage", after_triage, ["plan", "report"])
     graph.add_conditional_edges("plan", after_plan, ["policy_check", "report"])
     graph.add_conditional_edges("policy_check", after_policy, ["implement", "report"])
     graph.add_edge("implement", "validate")
-    graph.add_conditional_edges("validate", after_validate, ["review", "repair", "report"])
+    graph.add_conditional_edges("validate", after_validate, ["review", "diagnose", "report"])
+    graph.add_conditional_edges("diagnose", after_diagnose, ["repair", "report"])
     graph.add_conditional_edges("review", after_review, ["repair", "report"])
     graph.add_edge("repair", "validate")
     graph.add_edge("report", END)
@@ -254,7 +349,7 @@ def build_graph(cfg: RunConfig) -> Any:
 
 
 def final_status(state: RunState) -> Status:
-    if state.get("status") in ("error", "rejected"):
+    if state.get("status") in ("error", "rejected", "needs_human"):
         return state["status"]
     if not state.get("changed_files"):
         return "no_changes"
@@ -264,6 +359,13 @@ def final_status(state: RunState) -> Status:
     if result is None:
         return "error"  # review itself failed
     return "approved" if result.approved else "changes_requested"
+
+
+def _read(ws: Workspace, path: str) -> str | None:
+    try:
+        return ws.resolve(path).read_text()
+    except (OSError, UnicodeDecodeError, WorkspaceError):
+        return None
 
 
 def _failed_checks(results: list[CommandResult]) -> str:
@@ -325,6 +427,10 @@ def write_report(cfg: RunConfig, state: RunState) -> dict[str, Any]:
         "validation": [asdict(r) for r in state.get("validation", [])],
         "review": review.model_dump() | {"approved": review.approved} if review else None,
         "policy": policy_report(state["policy"]) if "policy" in state else None,
+        "jev": {
+            "enabled": cfg.decisions.enabled,
+            "decisions": [asdict(d) for d in cfg.decisions.log],
+        },
         "metrics": metrics(cfg.call_log),
         "llm_attempts": [asdict(r) for r in cfg.call_log.records],
     }
