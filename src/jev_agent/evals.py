@@ -81,7 +81,12 @@ def done_keys(results: Path, *, retry_errors: bool = False) -> set[tuple[str, st
 def result_row(case: Case, mode: str, repeat: int, outcome: RunOutcome) -> dict[str, Any]:
     report = outcome.report
     metrics = report.get("metrics") or {}
-    decisions = (report.get("jev") or {}).get("decisions") or []
+    # Only real Jev calls; disabled-mode fallbacks are logged too but cost nothing.
+    decisions = [
+        d
+        for d in (report.get("jev") or {}).get("decisions") or []
+        if not d.get("fallback") or d.get("error") != "jev disabled"
+    ]
     return {
         "case": case.id,
         "mode": mode,

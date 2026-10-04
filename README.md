@@ -22,6 +22,8 @@ uv run jev-agent doctor
 | `jev-agent models [pattern]` | Lists NVIDIA models your key can use |
 | `jev-agent bench [models…] -n 3` | Median latency + tool-call success per model (default: shortlist) |
 | `jev-agent run tickets/001-….md [--repo demo-api] [--approvals ask\|all\|none] [--no-jev]` | Ticket → plan → implement → validate on a copy; writes `runs/<id>/report.json` + `changes.diff` |
+| `jev-agent eval [--case ID] [--mode jev\|no-jev] [--repeats N]` | Run the eval cases; results to `evals/results/latest.jsonl` (resumable) |
+| `jev-agent eval-report [results.jsonl]` | Summary tables (Markdown) |
 | `jev-agent ask "Question?" -s '<state>'` | One yes/no Jev decision — for tuning question wording |
 
 ## Development
@@ -40,5 +42,5 @@ Agent instructions: [AGENTS.md](AGENTS.md).
 - [x] M3 — policy engine from AGENTS.md, scoped capabilities (incl. run_check), human approvals
 - [x] M4 — bounded repair, autofix, review agent (regression proof + PR still to do)
 - [x] M5 — Jev decision fabric: triage, plan risk/complexity → approval + model choice, semantic write gate, failure diagnosis, review verification
-- [ ] M6 — LangSmith tracing, evals, experiments
+- [x] M6 — LangSmith tracing, eval harness, Jev vs no-Jev comparison → [evaluation report](docs/evaluation-report.md)
 - [ ] M7 — `jev-agent init`, MCP server, demo script
