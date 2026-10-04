@@ -9,25 +9,53 @@ Python syntax are rejected before they touch the file.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 
 from langchain_core.tools import BaseTool, StructuredTool
 
+from jev_agent.policy import Policy
 from jev_agent.workspace import Workspace, WorkspaceError
 
 MAX_READ_CHARS = 20_000
 MAX_SEARCH_HITS = 50
+# Test selectors only: paths, `::` ids, parametrize brackets. No spaces or shell syntax.
+_TARGET = re.compile(r"^[\w./\-]+(::[\w\-\[\].]+)*$")
 
 
-def make_tools(ws: Workspace, *, writable: bool) -> list[BaseTool]:
+def make_tools(
+    ws: Workspace,
+    *,
+    writable: bool,
+    policy: Policy | None = None,
+    checks: Mapping[str, str] | None = None,
+    autofix: Sequence[str] = (),
+) -> list[BaseTool]:
+    """Tools for one workspace.
+
+    With a `policy`, every read and write is checked. With `checks` (the
+    project's declared commands), writers also get `run_check` — a way to
+    verify their own work without getting a shell.
+    """
+
+    def visible() -> list[str]:
+        return [f for f in ws.files() if policy is None or policy.readable(f)]
+
+    def rel(target: Path) -> str:
+        # Policy rules see the normalized path, so `./.env` or `app/../.env`
+        # cannot slip past a rule written for `.env`.
+        return target.relative_to(ws.root).as_posix()
+
     def list_files() -> str:
         """List every file in the repository (paths relative to the repo root)."""
-        return "\n".join(ws.files())
+        return "\n".join(visible())
 
     def read_file(path: str) -> str:
         """Read a text file. `path` is relative to the repo root."""
         try:
             target = ws.resolve(path)
+            if policy and (denied := policy.check_read(rel(target))):
+                return denied
             text = target.read_text()
         except (WorkspaceError, OSError, UnicodeDecodeError) as exc:
             return f"ERROR: {exc}"
@@ -42,7 +70,7 @@ def make_tools(ws: Workspace, *, writable: bool) -> list[BaseTool]:
         except re.error as exc:
             return f"ERROR: invalid regex: {exc}"
         hits: list[str] = []
-        for rel in ws.files():
+        for rel in visible():
             try:
                 lines = ws.resolve(rel).read_text().splitlines()
             except (OSError, UnicodeDecodeError):
@@ -62,6 +90,8 @@ def make_tools(ws: Workspace, *, writable: bool) -> list[BaseTool]:
             return f"ERROR: {exc}"
         if problem := _syntax_problem(path, content):
             return problem
+        if policy and (denied := policy.check_write(rel(target), content)):
+            return denied
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
         return f"wrote {path} ({len(content)} chars)"
@@ -74,6 +104,8 @@ def make_tools(ws: Workspace, *, writable: bool) -> list[BaseTool]:
         """
         try:
             target = ws.resolve(path)
+            if policy and (denied := policy.check_read(rel(target))):
+                return denied
             text = target.read_text()
         except (WorkspaceError, OSError) as exc:
             return f"ERROR: {exc}"
@@ -83,13 +115,48 @@ def make_tools(ws: Workspace, *, writable: bool) -> list[BaseTool]:
         updated = text.replace(old, new, 1)
         if problem := _syntax_problem(path, updated):
             return problem
+        if policy and (denied := policy.check_write(rel(target), updated)):
+            return denied
         target.write_text(updated)
         return f"edited {path}"
+
+    def run_check(name: str, target: str = "") -> str:
+        """Run one of the project's declared checks and return its output.
+
+        `name` is one of the check names listed in the tool description.
+        `target` optionally narrows a test run to a file or test id, e.g.
+        `tests/test_api.py` or `tests/test_api.py::test_login`.
+        """
+        assert checks is not None
+        command = checks.get(name)
+        if command is None:
+            return f"ERROR: unknown check {name!r}; available: {sorted(checks)}"
+        if target:
+            if not _TARGET.match(target):
+                return f"ERROR: invalid target {target!r}"
+            try:
+                ws.resolve(target.split("::", 1)[0])
+            except WorkspaceError as exc:
+                return f"ERROR: {exc}"
+            command = f"{command} {target}"
+        for fix in autofix:
+            ws.run(fix)
+        result = ws.run(command, max_chars=4000)
+        verdict = "PASSED" if result.ok else f"FAILED (exit {result.exit_code})"
+        return f"$ {command}\n{verdict}\n{result.output}"
 
     funcs: list[Callable[..., str]] = [list_files, read_file, search]
     if writable:
         funcs += [write_file, replace_in_file]
-    return [StructuredTool.from_function(f) for f in funcs]
+    tools: list[BaseTool] = [StructuredTool.from_function(f) for f in funcs]
+    if writable and checks:
+        tools.append(
+            StructuredTool.from_function(
+                run_check,
+                description=(run_check.__doc__ or "") + f"\nAvailable checks: {sorted(checks)}.",
+            )
+        )
+    return tools
 
 
 def _syntax_problem(path: str, content: str) -> str | None:

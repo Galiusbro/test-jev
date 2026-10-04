@@ -156,3 +156,33 @@ def test_edits_that_break_python_syntax_are_rejected(ws: Workspace) -> None:
     assert not (ws.root / "app" / "new.py").exists()
     # non-Python files are not syntax-checked
     assert write.invoke({"path": "notes.md", "content": "def f(:"}).startswith("wrote")
+
+
+def test_run_check_runs_only_declared_commands(ws: Workspace) -> None:
+    (ws.root / "marker").write_text("")
+    tools = {
+        t.name: t
+        for t in make_tools(
+            ws,
+            writable=True,
+            checks={"test": "ls", "fail": "exit 3"},
+            autofix=["touch fixed.txt"],
+        )
+    }
+    run_check = tools["run_check"]
+    assert "Available checks: ['fail', 'test']" in run_check.description
+
+    out = run_check.invoke({"name": "test", "target": "app/main.py"})
+    assert out.startswith("$ ls app/main.py\nPASSED")
+    assert (ws.root / "fixed.txt").exists()  # autofix ran first
+    assert "FAILED (exit 3)" in run_check.invoke({"name": "fail"})
+    assert run_check.invoke({"name": "rm"}).startswith("ERROR: unknown check")
+    for bad in ("x; rm -rf /", "$(whoami)", "a b", "../outside.py", "/etc/passwd"):
+        assert run_check.invoke({"name": "test", "target": bad}).startswith("ERROR"), bad
+    parametrized = run_check.invoke({"name": "test", "target": "app/main.py::test_x[case-1]"})
+    assert parametrized.startswith("$ ls app/main.py::test_x[case-1]")  # accepted, not rejected
+
+
+def test_run_check_only_for_writers_with_checks(ws: Workspace) -> None:
+    assert "run_check" not in [t.name for t in make_tools(ws, writable=False, checks={"t": "ls"})]
+    assert "run_check" not in [t.name for t in make_tools(ws, writable=True)]

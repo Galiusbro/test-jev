@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 from rich.console import Console
+from rich.prompt import Confirm
 from rich.table import Table
 
 from jev_agent.agents import StructuredOutputError
@@ -24,6 +27,7 @@ from jev_agent.decisions import (
 from jev_agent.decisions.client import State
 from jev_agent.graph import RunConfig, build_graph
 from jev_agent.llm import CallLog, LLMConfigError, LLMError, chat_model, list_models
+from jev_agent.policy import ApprovalRequest, Approver
 from jev_agent.tickets import load_ticket
 
 app = typer.Typer(help="Controlled ticket-to-PR agent.", no_args_is_help=True)
@@ -86,11 +90,20 @@ def doctor() -> None:
     raise typer.Exit(0 if ok else 1)
 
 
+class Approvals(StrEnum):
+    ASK = "ask"
+    ALL = "all"
+    NONE = "none"
+
+
 @app.command()
 def run(
     ticket_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="Ticket .md")],
     repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("demo-api"),
     runs_dir: Annotated[Path, typer.Option()] = Path("runs"),
+    approvals: Annotated[
+        Approvals, typer.Option(help="ask: prompt (deny without a terminal); all; none")
+    ] = Approvals.ASK,
 ) -> None:
     """Run the ticket-to-diff workflow on a copy of REPO."""
     settings = get_settings()
@@ -101,6 +114,7 @@ def run(
         repo=repo,
         run_dir=run_dir,
         models=lambda tier, log: chat_model(tier, settings, call_log=log),
+        approver=_approver(approvals),
     )
     console.print(f"[bold]{ticket.title}[/] → {run_dir}")
     state: dict[str, Any] = {"ticket": ticket, "started_at": time.time()}
@@ -112,12 +126,31 @@ def run(
     except (LLMError, LLMConfigError, StructuredOutputError) as exc:
         console.print(f"  [red]✗[/] {exc}")
         raise typer.Exit(1) from exc
+    if policy := state.get("policy"):
+        for d in policy.audit:
+            if d.verdict in ("deny", "rejected") and d.action != "plan":
+                console.print(f"  [red]policy blocked[/] {d.action} {d.target}: {d.reason}")
     status = state.get("status")
     color = "green" if status == "approved" else "red"
     if error := state.get("error"):
         console.print(f"  [red]{error}[/]")
     console.print(f"[{color}]{status}[/] · report: {run_dir / 'report.json'}")
     raise typer.Exit(0 if status == "approved" else 1)
+
+
+def _approver(mode: Approvals) -> Approver:
+    def decide(request: ApprovalRequest) -> bool:
+        reasons = "".join(f"\n      - {r}" for r in request.reasons)
+        console.print(f"  [yellow]approval needed[/] ({request.action}):{reasons}")
+        if mode is Approvals.ALL:
+            console.print("    [green]auto-approved[/] (--approvals all)")
+            return True
+        if mode is Approvals.NONE or not sys.stdin.isatty():
+            console.print("    [red]denied[/] (no interactive approval)")
+            return False
+        return Confirm.ask("    Approve?", default=False, console=console)
+
+    return decide
 
 
 def _describe(node: str, state: dict[str, Any]) -> str:
@@ -128,6 +161,11 @@ def _describe(node: str, state: dict[str, Any]) -> str:
             return " [red]failed[/]"
         plan = state["plan"]
         return f": {plan.summary} [dim](risk={plan.risk}, files={plan.files_to_change})[/]"
+    if node == "policy_check":
+        if state.get("status") == "rejected":
+            return " [red]rejected[/]"
+        plan_decision = [d for d in state["policy"].audit if d.action == "plan"][-1]
+        return f": {plan_decision.verdict} — {plan_decision.reason}"
     if node == "implement":
         done = "" if state["implement_finished"] else " [yellow]did not finish[/]"
         return f": {state['implement_steps']} steps, changed {state['changed_files']}{done}"

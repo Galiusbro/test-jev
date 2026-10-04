@@ -72,6 +72,13 @@ class Workspace:
         out = self._git("ls-files", "--cached", "--others", "--exclude-standard")
         return sorted(line for line in out.splitlines() if line)
 
+    def baseline(self, relative: str) -> str | None:
+        """Content of a file at the baseline commit, None if it did not exist."""
+        try:
+            return self._git("show", f"base:{relative}")
+        except WorkspaceError:
+            return None
+
     def diff(self) -> str:
         self._git("add", "-A")
         return self._git("diff", "--cached", "base")

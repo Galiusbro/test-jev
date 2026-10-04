@@ -286,3 +286,52 @@ def test_compact_keeps_latest_read_per_file_and_elides_the_rest() -> None:
     assert by_id[f"s{KEEP_RECENT_TOOL_OUTPUTS}"].startswith("hit")  # recent kept
     assert len(compact(history)) == len(history)
     assert str(history[2].content).startswith("old auth")  # input not mutated
+
+
+POLICY_MD = (
+    "\n## Allowed\n\n- Modify code under `app/`\n"
+    "\n## Approval required\n\n- Public API changes\n"
+    "\n## Forbidden\n\n- Modifying `AGENTS.md`\n"
+)
+
+
+def test_plan_needing_approval_is_rejected_by_default(repo: Path, tmp_path: Path) -> None:
+    (repo / "AGENTS.md").write_text((repo / "AGENTS.md").read_text() + POLICY_MD)
+    strong = [
+        *planner_script()[:-1],
+        call("Plan", **(PLAN_ARGS | {"public_api_change": True})),
+    ]
+    state, models = run(repo, tmp_path, strong, [])
+
+    assert state["status"] == "rejected"
+    assert "public api change" in state["error"]
+    assert models["coder"].seen == []  # nothing was implemented
+    report = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert report["policy"]["audit"][-1]["verdict"] == "rejected"
+    assert {r["kind"] for r in report["policy"]["rules"]} == {"allowed", "approval", "forbidden"}
+
+
+def test_approved_plan_proceeds_and_tool_denials_reach_the_model(
+    repo: Path, tmp_path: Path
+) -> None:
+    (repo / "AGENTS.md").write_text((repo / "AGENTS.md").read_text() + POLICY_MD)
+    strong = [
+        *planner_script()[:-1],
+        call("Plan", **(PLAN_ARGS | {"public_api_change": True})),
+        APPROVE,
+    ]
+    coder = [
+        call("write_file", "w1", path="AGENTS.md", content="# no rules\n"),
+        FIX,
+        say("done; AGENTS.md edit was refused"),
+    ]
+    state, models = run(repo, tmp_path, strong, coder, approver=lambda _r: True)
+
+    assert state["status"] == "approved"
+    denial = next(
+        m for m in models["coder"].seen[1] if isinstance(m, ToolMessage) and m.tool_call_id == "w1"
+    )
+    assert "denied by policy — Modifying `AGENTS.md`" in str(denial.content)
+    assert "## Forbidden" in (tmp_path / "run" / "repo" / "AGENTS.md").read_text()
+    verdicts = [d.verdict for d in state["policy"].audit]
+    assert verdicts[0] == "approved" and "deny" in verdicts

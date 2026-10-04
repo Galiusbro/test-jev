@@ -1,13 +1,15 @@
 """Ticket-to-diff workflow as a LangGraph state machine.
 
-    prepare_workspace → plan → implement → validate ─┬→ review ─┬→ report
-                                   ↑                 │          │
-                                   └──── repair ←────┴──────────┘
-                                   (bounded: max_repair_attempts)
+    prepare_workspace → plan → policy_check → implement → validate ─┬→ review ─┬→ report
+                                     │                   ↑            │          │
+                                     └→ report           └── repair ←─┴──────────┘
+                                     (rejected)          (bounded: max_repair_attempts)
 
 `validate` runs the project's autofix commands, then its checks. Failed checks
 or blocking review findings send the change to `repair` while attempts remain.
-Policy checks and Jev decision edges plug into this graph in later milestones.
+`policy_check` applies the target's AGENTS.md rules to the plan (forbidden
+files reject the run; approval-required changes ask the human), and the same
+policy guards every tool call. Jev decision edges plug in later.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 
 from jev_agent.agents import (
@@ -33,12 +36,15 @@ from jev_agent.agents import (
 )
 from jev_agent.config import ModelTier
 from jev_agent.llm import CallLog, LLMError
+from jev_agent.policy import Approver, Policy, deny_all, parse_rules
 from jev_agent.project import ProjectInstructions, load_instructions
 from jev_agent.tickets import Ticket
 from jev_agent.tools import make_tools
 from jev_agent.workspace import CommandResult, Workspace
 
-Status = Literal["approved", "changes_requested", "validation_failed", "no_changes", "error"]
+Status = Literal[
+    "approved", "changes_requested", "validation_failed", "no_changes", "rejected", "error"
+]
 ModelFactory = Callable[[ModelTier, CallLog], BaseChatModel]
 
 
@@ -53,12 +59,14 @@ class RunConfig:
     repair_max_steps: int = 15
     max_repair_attempts: int = 3
     setup_command: str | None = "uv sync --quiet"
+    approver: Approver = deny_all
 
 
 class RunState(TypedDict, total=False):
     ticket: Ticket
     workspace: Workspace
     instructions: ProjectInstructions
+    policy: Policy
     setup: CommandResult
     plan: Plan
     implement_finished: bool
@@ -80,11 +88,23 @@ def build_graph(cfg: RunConfig) -> Any:
     def model(tier: ModelTier) -> BaseChatModel:
         return cfg.models(tier, cfg.call_log)
 
+    def writer_tools(state: RunState) -> list[BaseTool]:
+        instructions = state["instructions"]
+        return make_tools(
+            state["workspace"],
+            writable=True,
+            policy=state["policy"],
+            checks=instructions.commands,
+            autofix=list(instructions.autofix.values()),
+        )
+
     def prepare_workspace(state: RunState) -> RunState:
         ws = Workspace.create(cfg.repo, cfg.run_dir)
+        instructions = load_instructions(ws.root)
         update: RunState = {
             "workspace": ws,
-            "instructions": load_instructions(ws.root),
+            "instructions": instructions,
+            "policy": Policy(parse_rules(instructions.text), cfg.approver, ws.baseline),
             "repair_attempts": 0,
             "repairs": [],
         }
@@ -93,7 +113,7 @@ def build_graph(cfg: RunConfig) -> Any:
         return update
 
     def plan(state: RunState) -> RunState:
-        tools = make_tools(state["workspace"], writable=False)
+        tools = make_tools(state["workspace"], writable=False, policy=state["policy"])
         try:
             result, _ = plan_ticket(
                 model(ModelTier.STRONG),
@@ -106,8 +126,14 @@ def build_graph(cfg: RunConfig) -> Any:
             return {"status": "error", "error": f"planning failed: {exc}"}
         return {"plan": result}
 
+    def policy_check(state: RunState) -> RunState:
+        verdict = state["policy"].check_plan(state["plan"])
+        if verdict.approved:
+            return {}
+        return {"status": "rejected", "error": "plan rejected: " + "; ".join(verdict.reasons)}
+
     def implement(state: RunState) -> RunState:
-        tools = make_tools(state["workspace"], writable=True)
+        tools = writer_tools(state)
         loop = implement_plan(
             model(ModelTier.CODER),
             tools,
@@ -158,7 +184,7 @@ def build_graph(cfg: RunConfig) -> Any:
             problems = _blocking_findings(state["review"])
         loop = repair_change(
             model(ModelTier.CODER),
-            make_tools(state["workspace"], writable=True),
+            writer_tools(state),
             state["ticket"],
             state["plan"],
             state["instructions"],
@@ -180,7 +206,10 @@ def build_graph(cfg: RunConfig) -> Any:
         return {"status": status}
 
     def after_plan(state: RunState) -> str:
-        return "report" if state.get("status") == "error" else "implement"
+        return "report" if state.get("status") == "error" else "policy_check"
+
+    def after_policy(state: RunState) -> str:
+        return "report" if state.get("status") == "rejected" else "implement"
 
     def can_repair(state: RunState) -> bool:
         return state.get("repair_attempts", 0) < cfg.max_repair_attempts
@@ -202,6 +231,7 @@ def build_graph(cfg: RunConfig) -> Any:
     for name, node in [
         ("prepare_workspace", prepare_workspace),
         ("plan", plan),
+        ("policy_check", policy_check),
         ("implement", implement),
         ("validate", validate),
         ("review", review),
@@ -211,7 +241,8 @@ def build_graph(cfg: RunConfig) -> Any:
         graph.add_node(name, node)
     graph.add_edge(START, "prepare_workspace")
     graph.add_edge("prepare_workspace", "plan")
-    graph.add_conditional_edges("plan", after_plan, ["implement", "report"])
+    graph.add_conditional_edges("plan", after_plan, ["policy_check", "report"])
+    graph.add_conditional_edges("policy_check", after_policy, ["implement", "report"])
     graph.add_edge("implement", "validate")
     graph.add_conditional_edges("validate", after_validate, ["review", "repair", "report"])
     graph.add_conditional_edges("review", after_review, ["repair", "report"])
@@ -221,8 +252,8 @@ def build_graph(cfg: RunConfig) -> Any:
 
 
 def final_status(state: RunState) -> Status:
-    if state.get("status") == "error":
-        return "error"
+    if state.get("status") in ("error", "rejected"):
+        return state["status"]
     if not state.get("changed_files"):
         return "no_changes"
     if not state.get("checks_passed"):
@@ -248,6 +279,14 @@ def _blocking_findings(result: Review) -> str:
         for f in result.blocking
     ]
     return "A code review requested changes:\n\n" + "\n".join(lines)
+
+
+def policy_report(policy: Policy) -> dict[str, Any]:
+    return {
+        "rules": [{"kind": r.kind, "text": r.text, "enforced": r.enforced} for r in policy.rules],
+        "audit": [asdict(d) for d in policy.audit],
+        "approved_paths": sorted(policy.approved_paths),
+    }
 
 
 def metrics(log: CallLog) -> dict[str, Any]:
@@ -283,6 +322,7 @@ def write_report(cfg: RunConfig, state: RunState) -> dict[str, Any]:
         "repairs": state.get("repairs", []),
         "validation": [asdict(r) for r in state.get("validation", [])],
         "review": review.model_dump() | {"approved": review.approved} if review else None,
+        "policy": policy_report(state["policy"]) if "policy" in state else None,
         "metrics": metrics(cfg.call_log),
         "llm_attempts": [asdict(r) for r in cfg.call_log.records],
     }

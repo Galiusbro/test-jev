@@ -216,8 +216,10 @@ Make the change described in the plan using the tools. Rules:
 - Edit only the files the plan lists (plus new test files it names).
 - Prefer `replace_in_file` for small edits; read a file before editing it.
 - Follow the project's conventions and add the tests the plan asks for.
-- You cannot run commands; validation runs automatically after you finish.
-- When the change is complete, stop calling tools and reply with a short summary.
+- Use `run_check` to run the tests (and other checks) yourself; run the tests
+  before you finish and fix what fails. Formatting is applied automatically.
+- When the change is complete and the tests pass, stop calling tools and reply
+  with a short summary.
 
 Project rules (AGENTS.md):
 {rules}
@@ -255,8 +257,10 @@ checks or a code review found problems. Fix them with the tools.
 - Keep the change within the ticket's scope. Never weaken, skip or delete
   pre-existing tests; tests added for this ticket may be corrected if they
   contradict the ticket.
-- You cannot run commands; checks run automatically after you finish.
-- When done, stop calling tools and reply with a short summary of the fix.
+- Use `run_check` to reproduce the failure first, form a hypothesis, then
+  verify your fix by running the check again. Formatting is applied
+  automatically.
+- When the checks pass, stop calling tools and reply with a short summary.
 
 Project rules (AGENTS.md):
 {rules}
