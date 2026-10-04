@@ -5,7 +5,7 @@
 LangGraph orchestrates the workflow, **Jev** (TypeSafe API) makes typed
 decisions on its edges, free **NVIDIA API Catalog** models write the code, and
 plain Python enforces policy. Full design: [PROJECT_IDEA.md](PROJECT_IDEA.md) ·
-results: [evaluation report](docs/evaluation-report.md) · walkthrough: [demo script](docs/demo.md) ·
+results: [evaluation report](docs/evaluation-report.md) · walkthrough: [demo script](docs/demo.md) · file map: [project map](docs/project-map.md) ·
 example output: [PR #1](https://github.com/Galiusbro/test-jev/pull/1).
 
 ## Setup
