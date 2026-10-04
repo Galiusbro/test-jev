@@ -67,6 +67,7 @@ def run(
         log.add(CallRecord(model=f"scripted-{tier}", ok=True, elapsed_s=0.1, input_tokens=10))
         return models[tier.value]
 
+    cfg.setdefault("sleep", lambda _s: None)
     config = RunConfig(
         repo=repo, run_dir=tmp_path / "run", models=factory, setup_command=None, **cfg
     )
@@ -172,7 +173,11 @@ def test_unresolved_review_is_changes_requested(repo: Path, tmp_path: Path) -> N
 def test_review_failure_is_error(repo: Path, tmp_path: Path) -> None:
     from jev_agent.llm import LLMError
 
-    strong: list[AIMessage | Exception] = [*planner_script(), LLMError("all models failed")]
+    strong: list[AIMessage | Exception] = [
+        *planner_script(),
+        LLMError("all models failed"),
+        LLMError("all models failed"),  # still down after the pause
+    ]
     state, _ = run(repo, tmp_path, strong, [FIX, say("done")])
     assert state["status"] == "error"
     assert "review failed" in state["error"]
@@ -379,7 +384,8 @@ def test_failed_review_never_routes_on_a_stale_verdict(repo: Path, tmp_path: Pat
     strong: list[AIMessage | Exception] = [
         *planner_script(),
         changes,
-        LLMError("all models failed"),  # second review fails
+        LLMError("all models failed"),  # second review fails…
+        LLMError("all models failed"),  # …and again after the pause
     ]
     coder = [FIX, say("done"), call("read_file", path="app/main.py"), say("addressed")]
     state, _ = run(repo, tmp_path, strong, coder)
@@ -553,3 +559,17 @@ def test_run_agent_full_step_budget_with_jev_middleware(tmp_path: Path, repo: Pa
     result = run_agent(model, make_tools(ws, writable=True), "system", "go", 30, [gate])
     assert result.error is None
     assert (result.steps, result.finished) == (30, False)
+
+
+def test_review_survives_a_short_outage(repo: Path, tmp_path: Path) -> None:
+    from jev_agent.llm import LLMError
+
+    pauses: list[float] = []
+    strong: list[AIMessage | Exception] = [
+        *planner_script(),
+        LLMError("all models failed"),
+        APPROVE,  # back after the pause
+    ]
+    state, _ = run(repo, tmp_path, strong, [FIX, say("done")], sleep=pauses.append)
+    assert state["status"] == "approved"
+    assert pauses == [60.0]

@@ -123,3 +123,22 @@ def test_execute_run_llm_crash_becomes_error_report(
     assert result.status == "error"
     saved = json.loads((result.run_dir / "report.json").read_text())
     assert saved == {"status": "error", "error": "all models failed"}
+
+
+def test_infra_errors_are_separated_and_retryable(tmp_path: Path) -> None:
+    case = Case("a", Path("t"), Approvals.ALL, ("approved",))
+    lost = result_row(case, "jev", 1, outcome("error", error="review failed: all models failed"))
+    assert lost["infra_error"] is True and lost["passed"] is False
+    real = result_row(case, "no-jev", 1, outcome("error", error="planning failed: invalid Plan"))
+    assert real["infra_error"] is False
+
+    results = tmp_path / "r.jsonl"
+    results.write_text(json.dumps(lost) + "\n" + json.dumps(real) + "\n")
+    assert evals.done_keys(results) == {("a", "jev", 1), ("a", "no-jev", 1)}
+    assert evals.done_keys(results, retry_errors=True) == {("a", "no-jev", 1)}
+
+    rerun = result_row(case, "jev", 1, outcome("approved"))
+    text = summarize([lost, real, rerun])  # the rerun replaces the lost run
+    assert "| jev | 1 | 1/1 | 0 |" in text
+    assert "| no-jev | 1 | 0/1 | 0 |" in text
+    assert "| jev | 1 | 0/0 | 1 |" in summarize([lost])

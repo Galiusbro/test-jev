@@ -159,6 +159,9 @@ def eval_(
     results: Annotated[Path, typer.Option()] = Path("evals/results/latest.jsonl"),
     repo: Annotated[Path, typer.Option(exists=True, file_okay=False)] = Path("demo-api"),
     runs_dir: Annotated[Path, typer.Option()] = Path("runs"),
+    retry_errors: Annotated[
+        bool, typer.Option(help="Rerun runs lost to a provider outage (infra errors).")
+    ] = False,
 ) -> None:
     """Run the eval cases in each mode; resumable (appends to RESULTS)."""
     chosen = modes or list(MODES)
@@ -176,6 +179,7 @@ def eval_(
         repo=repo,
         runs_dir=runs_dir,
         log=console.print,
+        retry_errors=retry_errors,
     )
     console.print(summarize(read_results(results)))
 

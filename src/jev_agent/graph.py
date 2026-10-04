@@ -81,6 +81,10 @@ class RunConfig:
     setup_command: str | None = "uv sync --quiet"
     approver: Approver = deny_all
     decisions: Decisions = field(default_factory=lambda: Decisions(None))
+    # Review is the last step: when the whole strong chain is down, wait and
+    # try again rather than throw away a validated change.
+    review_retry_pause_s: float = 60.0
+    sleep: Callable[[float], None] = time.sleep
 
 
 class RunState(TypedDict, total=False):
@@ -251,13 +255,20 @@ def build_graph(cfg: RunConfig) -> Any:
         }
 
     def review(state: RunState) -> RunState:
-        try:
-            result = review_change(
+        def attempt() -> Review:
+            return review_change(
                 model(ModelTier.STRONG),
                 state["ticket"],
                 state["instructions"],
                 state["workspace"].diff(),
             )
+
+        try:
+            try:
+                result = attempt()
+            except LLMError:
+                cfg.sleep(cfg.review_retry_pause_s)
+                result = attempt()
         except (LLMError, StructuredOutputError) as exc:
             return {"review": None, "error": f"review failed: {exc}"}
         return {"review": _verify(result, state)}

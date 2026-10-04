@@ -45,11 +45,35 @@ def load_cases(path: Path, only: Sequence[str] = ()) -> list[Case]:
     return [c for c in cases if not only or c.id in only]
 
 
-def done_keys(results: Path) -> set[tuple[str, str, int]]:
+INFRA_MARKER = "all models failed"  # the whole LLM fallback chain was unavailable
+
+
+def is_infra_error(status: str, error: str | None) -> bool:
+    return status == "error" and INFRA_MARKER in (error or "")
+
+
+def latest(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Last row per (case, mode, repeat): reruns replace earlier attempts."""
+    by_key = {
+        (r["case"], r["mode"], r["repeat"]): {
+            # rows written before `infra_error` existed get it derived
+            "infra_error": is_infra_error(r["status"], r.get("error")),
+            **r,
+        }
+        for r in rows
+    }
+    return list(by_key.values())
+
+
+def done_keys(results: Path, *, retry_errors: bool = False) -> set[tuple[str, str, int]]:
     if not results.exists():
         return set()
-    rows = [json.loads(line) for line in results.read_text().splitlines() if line.strip()]
-    return {(r["case"], r["mode"], r["repeat"]) for r in rows}
+    rows = latest(read_results(results))
+    return {
+        (r["case"], r["mode"], r["repeat"])
+        for r in rows
+        if not (retry_errors and r.get("infra_error"))
+    }
 
 
 def result_row(case: Case, mode: str, repeat: int, outcome: RunOutcome) -> dict[str, Any]:
@@ -62,6 +86,7 @@ def result_row(case: Case, mode: str, repeat: int, outcome: RunOutcome) -> dict[
         "repeat": repeat,
         "status": outcome.status,
         "passed": outcome.status in case.expect,
+        "infra_error": is_infra_error(outcome.status, report.get("error")),
         "expect": list(case.expect),
         "duration_s": report.get("duration_s"),
         "llm_calls": metrics.get("llm_calls", 0),
@@ -88,9 +113,10 @@ def run_series(
     repo: Path,
     runs_dir: Path,
     log: Callable[[str], None],
+    retry_errors: bool = False,
 ) -> None:
     results.parent.mkdir(parents=True, exist_ok=True)
-    skip = done_keys(results)
+    skip = done_keys(results, retry_errors=retry_errors)
     for repeat in range(1, repeats + 1):
         for case in cases:
             for mode in modes:
@@ -111,7 +137,13 @@ def run_series(
                 row = result_row(case, mode, repeat, outcome)
                 with results.open("a") as fh:
                     fh.write(json.dumps(row) + "\n")
-                verdict = "[green]pass[/]" if row["passed"] else "[red]FAIL[/]"
+                verdict = (
+                    "[green]pass[/]"
+                    if row["passed"]
+                    else "[yellow]infra error[/]"
+                    if row["infra_error"]
+                    else "[red]FAIL[/]"
+                )
                 log(f"  → {row['status']} {verdict} ({row['duration_s']}s)")
 
 
@@ -126,7 +158,12 @@ def _fmt(value: float | None, digits: int = 0) -> str:
 
 
 def summarize(rows: Sequence[dict[str, Any]]) -> str:
-    """Markdown report: overall per mode, then per case and mode."""
+    """Markdown report: overall per mode, then per case and mode.
+
+    Runs lost to a provider outage (`infra_error`) are listed but excluded
+    from the correctness denominator — they say nothing about the agent.
+    """
+    rows = latest(rows)
     by_mode: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_case: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
@@ -134,16 +171,18 @@ def summarize(rows: Sequence[dict[str, Any]]) -> str:
         by_case[(r["case"], r["mode"])].append(r)
 
     lines = [
-        "| Mode | Runs | Correct outcome | Median time, s | Total time, min "
+        "| Mode | Runs | Correct outcome | Infra errors | Median time, s | Total time, min "
         "| Input tokens (total) | Repairs | Failed LLM attempts | Jev calls (total s) |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for mode in sorted(by_mode):
         rs = by_mode[mode]
         passed = sum(r["passed"] for r in rs)
+        infra = sum(bool(r.get("infra_error")) for r in rs)
         durations = [r["duration_s"] for r in rs if r["duration_s"] is not None]
         lines.append(
-            f"| {mode} | {len(rs)} | {passed}/{len(rs)} | {_fmt(_median(durations))} "
+            f"| {mode} | {len(rs)} | {passed}/{len(rs) - infra} | {infra} "
+            f"| {_fmt(_median(durations))} "
             f"| {_fmt(sum(durations) / 60, 1)} | {_fmt(sum(r['input_tokens'] for r in rs))} "
             f"| {sum(r['repairs'] for r in rs)} | {sum(r['failed_attempts'] for r in rs)} "
             f"| {sum(r['jev_decisions'] for r in rs)} "
