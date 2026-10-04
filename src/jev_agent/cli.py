@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tracers.context import collect_runs
 from rich.console import Console
 from rich.prompt import Confirm
 from rich.table import Table
@@ -28,6 +30,7 @@ from jev_agent.decisions.client import State
 from jev_agent.decisions.fabric import Decisions
 from jev_agent.graph import RunConfig, build_graph
 from jev_agent.llm import CallLog, LLMConfigError, LLMError, chat_model, list_models
+from jev_agent.observability import configure_tracing, flush, run_url
 from jev_agent.policy import ApprovalRequest, Approver
 from jev_agent.tickets import load_ticket
 
@@ -88,6 +91,18 @@ def doctor() -> None:
         ok = False
         console.print(f"[red]✗[/] Jev: {exc}")
 
+    if configure_tracing(settings):
+        try:
+            from langsmith import Client
+
+            next(iter(Client().list_projects(limit=1)), None)
+            console.print(f"[green]✓[/] LangSmith: project {settings.langsmith_project!r}")
+        except Exception as exc:  # noqa: BLE001 — report, keep exit code honest
+            ok = False
+            console.print(f"[red]✗[/] LangSmith: {exc}")
+    else:
+        console.print("[dim]- LangSmith: off (no LANGSMITH_API_KEY)[/]")
+
     raise typer.Exit(0 if ok else 1)
 
 
@@ -119,19 +134,42 @@ def run(
         approver=_approver(approvals),
         decisions=_decisions(settings, enabled=jev),
     )
+    tracing = configure_tracing(settings)
     console.print(
         f"[bold]{ticket.title}[/] → {run_dir} "
-        f"[dim](jev {'on' if cfg.decisions.enabled else 'off'})[/]"
+        f"[dim](jev {'on' if cfg.decisions.enabled else 'off'}, "
+        f"langsmith {'on' if tracing else 'off'})[/]"
     )
     state: dict[str, Any] = {"ticket": ticket, "started_at": time.time()}
+    config: RunnableConfig = {
+        "run_name": f"ticket {ticket.id}",
+        "tags": ["jev" if cfg.decisions.enabled else "no-jev", f"approvals:{approvals.value}"],
+        "metadata": {
+            "ticket": ticket.id,
+            "jev": cfg.decisions.enabled,
+            "run_dir": str(run_dir),
+            "models": {t.value: settings.models_for(t) for t in ModelTier},
+        },
+    }
     try:
-        for update in build_graph(cfg).stream(state, stream_mode="updates"):
-            for node, delta in update.items():
-                state.update(delta or {})
-                console.print(f"  [green]✓[/] {node}{_describe(node, state)}")
+        with collect_runs() as runs:
+            for update in build_graph(cfg).stream(state, config, stream_mode="updates"):
+                for node, delta in update.items():
+                    state.update(delta or {})
+                    console.print(f"  [green]✓[/] {node}{_describe(node, state)}")
     except (LLMError, LLMConfigError, StructuredOutputError) as exc:
         console.print(f"  [red]✗[/] {exc}")
         raise typer.Exit(1) from exc
+    finally:
+        if tracing:
+            flush()
+    if (
+        tracing
+        and runs.traced_runs
+        and (url := run_url(runs.traced_runs[0], settings.langsmith_project))
+    ):
+        console.print(f"  [dim]trace:[/] {url}")
+        _add_to_report(run_dir, {"langsmith_url": url})
     if policy := state.get("policy"):
         for d in policy.audit:
             if d.verdict in ("deny", "rejected") and d.action != "plan":
@@ -163,6 +201,12 @@ def _approver(mode: Approvals) -> Approver:
         return Confirm.ask("    Approve?", default=False, console=console)
 
     return decide
+
+
+def _add_to_report(run_dir: Path, fields: dict[str, Any]) -> None:
+    path = run_dir / "report.json"
+    if path.exists():
+        path.write_text(json.dumps(json.loads(path.read_text()) | fields, indent=2))
 
 
 def _describe(node: str, state: dict[str, Any]) -> str:

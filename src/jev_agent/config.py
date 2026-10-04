@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # Decisions below this confidence take the conservative branch.
     jev_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
 
+    # LangSmith tracing (smith.langchain.com); on whenever a key is set.
+    langsmith_api_key: SecretStr | None = None
+    langsmith_project: str = "jev-agent"
+    langsmith_tracing: bool = True
+    langsmith_endpoint: str | None = None  # EU / self-hosted
+
     # Workflow limits.
     max_repair_attempts: int = Field(default=3, ge=0)
 
