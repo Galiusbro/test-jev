@@ -9,6 +9,7 @@ PR with a body built from the run report.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 import time
@@ -38,7 +39,12 @@ def run_gh(args: Sequence[str], cwd: Path) -> str:
     return proc.stdout.strip()
 
 
-def pr_body(report: dict[str, Any]) -> str:
+_NUMBERED = re.compile(r"^\s*\d+[.)]\s+")
+
+
+def pr_body(report: dict[str, Any], prefix: str = "") -> str:
+    """Markdown PR description; `prefix` is the target's path inside the git repo."""
+    base = f"{prefix.rstrip('/')}/" if prefix and prefix != "." else ""
     plan = report.get("plan") or {}
     review = report.get("review") or {}
     proof = report.get("regression_proof") or {}
@@ -58,11 +64,12 @@ def pr_body(report: dict[str, Any]) -> str:
         "",
         "## Changes",
         "",
-        *[f"- `{path}`" for path in report.get("changed_files", [])],
+        *[f"- `{base}{path}`" for path in report.get("changed_files", [])],
         "",
         "## Plan",
         "",
-        *[f"{i}. {step}" for i, step in enumerate(plan.get("steps", []), 1)],
+        # Models often number their steps already; don't double the numbering.
+        *[f"{i}. {_NUMBERED.sub('', step)}" for i, step in enumerate(plan.get("steps", []), 1)],
         "",
         f"Risk: **{plan.get('risk', '?')}** · public API change: "
         f"**{plan.get('public_api_change')}** · DB migration: **{plan.get('db_migration')}**",
@@ -143,7 +150,7 @@ def open_pull_request(
             "--title",
             ticket["title"],
             "--body",
-            pr_body(report),
+            pr_body(report, prefix),
         ],
         repo_root,
     )

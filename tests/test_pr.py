@@ -136,3 +136,11 @@ def test_pr_body_contains_the_evidence() -> None:
         "write gate: 1 edits screened",
     ):
         assert expected in body, expected
+
+
+def test_pr_body_prefixes_paths_and_does_not_double_number() -> None:
+    body = pr_body(REPORT, "demo")
+    assert "- `demo/app/main.py`" in body
+    assert "1. Edit main.py" in body and "1. 1." not in body
+    assert "2. Run tests" in body
+    assert "- `app/main.py`" in pr_body(REPORT, ".")
