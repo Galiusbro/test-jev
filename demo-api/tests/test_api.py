@@ -52,3 +52,14 @@ def test_login_wrong_password(client: TestClient, registered: dict[str, str]) ->
 def test_login_unknown_email(client: TestClient) -> None:
     response = client.post("/login", json={"email": "ghost@example.com", "password": "x"})
     assert response.status_code == 401
+
+
+def test_rate_limit_failed_logins(client: TestClient, registered: dict[str, str]) -> None:
+    # Perform 5 failed attempts
+    for _ in range(5):
+        resp = client.post("/login", json={"email": registered["email"], "password": "wrong"})
+        assert resp.status_code == 401
+    # 6th attempt should be rate limited
+    resp = client.post("/login", json={"email": registered["email"], "password": "wrong"})
+    assert resp.status_code == 429
+    assert resp.json()["detail"] == "Too many failed login attempts"
